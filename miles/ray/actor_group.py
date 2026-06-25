@@ -123,6 +123,15 @@ class RayTrainGroup:
         """Broadcast weights from rank 0 to all other ranks."""
         await self._broadcast("update_weights")
 
+    async def run_continuous_sft_engine(self, engine_cfg: dict) -> dict:
+        """Run the in-actor continuous SFT engine on every rank (SPMD).
+
+        Each rank runs an identical engine over identically-tokenized data, so
+        the Megatron collectives line up. Returns rank 0's job summary.
+        """
+        results = await self._broadcast("run_continuous_sft_engine", engine_cfg)
+        return results[0] if results else {}
+
     async def load_pending_adapters(self) -> int:
         """Multi-LoRA: model-side install of PENDING adapters on every rank.
         Returns the number installed so the caller can decide whether the next

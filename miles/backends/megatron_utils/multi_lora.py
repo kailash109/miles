@@ -2,6 +2,7 @@ import dataclasses
 import logging
 from argparse import Namespace
 from pathlib import Path
+from typing import Any
 
 import torch
 
@@ -180,6 +181,74 @@ def find_latest_checkpoint(ckpt_dir: Path) -> Path | None:
         if all_present:
             return step_dir / f"adapter_megatron_tp{tp_rank}_pp{pp_rank}.pt"
     return None
+
+
+def iter_named_multi_lora_modules(model):
+    """Yield ``(stable_module_prefix, MultiLoRALinear)`` pairs.
+
+    The prefix is stable across process restarts and slot moves (it is the
+    model-chunk index + the module's ``named_modules`` path), unlike Python
+    object ids, so it is safe as a durable optimizer-state key.
+    """
+    models = model if isinstance(model, list) else [model]
+    for chunk_i, model_chunk in enumerate(models):
+        for name, module in model_chunk.named_modules():
+            if module.__class__.__name__ == "MultiLoRALinear":
+                yield f"chunk{chunk_i}.{name}", module
+
+
+def iter_adapter_named_params_for_slot(model, idx: int):
+    """Yield ``(stable_name, param)`` for adapter slot ``idx``."""
+    for module_prefix, module in iter_named_multi_lora_modules(model):
+        adapter = module.adapters[idx]
+        for name, param in adapter.named_parameters():
+            yield f"{module_prefix}.adapters.{idx}.{name}", param
+
+
+def capture_optimizer_state_for_adapter(optimizer, model, idx: int) -> dict:
+    """Snapshot (CPU) Adam state for adapter slot ``idx`` keyed by stable name."""
+    name_by_main_param_id: dict[int, str] = {}
+    for stable_name, param in iter_adapter_named_params_for_slot(model, idx):
+        main = getattr(param, "main_param", None)
+        key_param = main if main is not None else param
+        name_by_main_param_id[id(key_param)] = stable_name
+
+    captured: dict[tuple[int, str], dict] = {}
+    chained = getattr(optimizer, "chained_optimizers", [optimizer])
+    for opt_i, chained_optimizer in enumerate(chained):
+        inner = getattr(chained_optimizer, "optimizer", chained_optimizer)
+        for param, state in inner.state.items():
+            stable_name = name_by_main_param_id.get(id(param))
+            if stable_name is None:
+                continue
+            captured[(opt_i, stable_name)] = {
+                k: (v.detach().cpu().clone() if torch.is_tensor(v) else v)
+                for k, v in state.items()
+            }
+    return captured
+
+
+def restore_optimizer_state_for_adapter(optimizer, model, idx: int, captured: dict) -> None:
+    """Restore Adam state captured by ``capture_optimizer_state_for_adapter``."""
+    param_by_stable_name: dict[str, Any] = {}
+    for stable_name, param in iter_adapter_named_params_for_slot(model, idx):
+        main = getattr(param, "main_param", None)
+        key_param = main if main is not None else param
+        param_by_stable_name[stable_name] = key_param
+
+    chained = getattr(optimizer, "chained_optimizers", [optimizer])
+    for opt_i, chained_optimizer in enumerate(chained):
+        inner = getattr(chained_optimizer, "optimizer", chained_optimizer)
+        for (saved_opt_i, stable_name), state in captured.items():
+            if saved_opt_i != opt_i:
+                continue
+            param = param_by_stable_name.get(stable_name)
+            if param is None:
+                continue
+            inner.state[param] = {
+                k: (v.to(device=param.device) if torch.is_tensor(v) else v)
+                for k, v in state.items()
+            }
 
 
 def zero_optimizer_state_for_adapter(optimizer, model, idx: int) -> None:

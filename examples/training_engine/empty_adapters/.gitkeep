@@ -1,0 +1,3 @@
+# Intentionally empty: --multi-lora-dir points here so the Megatron MultiLoRA
+# model is built with N free slots and no preloaded adapters. The continuous
+# training engine assigns slots and trains adapters at runtime.

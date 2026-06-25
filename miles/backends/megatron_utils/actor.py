@@ -476,6 +476,106 @@ class MegatronTrainRayActor(TrainRayActor):
         log_perf_data(rollout_id, self.args)
 
     @timer
+    def run_continuous_sft_engine(self, engine_cfg: dict) -> dict:
+        """Run the continuous MultiLoRA training engine in-process on this actor.
+
+        Reuses the model/optimizer this actor already built. Every rank runs an
+        identical in-process engine over identically-tokenized data, so
+        scheduling/slot decisions and the packed batches agree across ranks and
+        the Megatron collectives line up (SPMD). Adapter identity is keyed by
+        adapter name (not a per-rank uuid) so artifact paths agree too.
+
+        ``engine_cfg`` shape::
+
+            {
+              "jobs": [
+                {"name": str, "rank": int, "alpha": int,
+                 "target_modules": [..], "output_uri": str, "max_steps": int,
+                 "records": [{"prompt": .., "completion": ..}, ...]},
+                ...
+              ],
+              "scheduler": {"train_tokens_per_step": int,
+                            "max_adapters_per_step": int,
+                            "base_quantum_tokens": int},
+              "tokens_per_update": int,
+              "max_engine_steps": int,
+            }
+        """
+        from miles.training_engine.client import build_job_spec
+        from miles.training_engine.dataset_worker import build_sft_examples
+        from miles.training_engine.job_controller import make_training_job_controller
+        from miles.training_engine.runner import ContinuousTrainingRunner
+        from miles.training_engine.scheduler import ContinuousTrainingScheduler
+        from miles.training_engine.schemas import DatasetSpec
+        from miles.training_engine.trajectory_store import ExampleStore, TrajectoryStore
+
+        base_model = self.args.hf_checkpoint
+        max_hot_slots = self.args.multi_lora_n_adapters
+        # Always a Ray actor handle so the runner/pager have one uniform control
+        # path. Each rank creates its own (unnamed) controller; identical inputs
+        # -> identical decisions, so the SPMD collectives stay aligned.
+        controller = make_training_job_controller(base_model, max_hot_slots)
+        example_store = ExampleStore()
+        trajectory_store = TrajectoryStore()
+
+        sched_cfg = engine_cfg.get("scheduler", {})
+        scheduler = ContinuousTrainingScheduler(
+            train_tokens_per_step=sched_cfg.get("train_tokens_per_step", 8192),
+            max_adapters_per_step=sched_cfg.get("max_adapters_per_step", max_hot_slots),
+            base_quantum_tokens=sched_cfg.get("base_quantum_tokens", 2048),
+        )
+
+        eos_id = getattr(self.tokenizer, "eos_token_id", None)
+
+        def encode(text: str) -> list[int]:
+            return self.tokenizer.encode(text, add_special_tokens=False)
+
+        dataset_spec = DatasetSpec(format="prompt_completion_jsonl")
+        for job_cfg in engine_cfg["jobs"]:
+            name = job_cfg["name"]
+            spec = build_job_spec(
+                base_model=base_model,
+                job_id=name,  # deterministic identity across ranks
+                adapter={
+                    "name": name,
+                    "rank": job_cfg.get("rank", self.args.lora_rank),
+                    "alpha": job_cfg.get("alpha", self.args.lora_alpha),
+                    "target_modules": job_cfg["target_modules"],
+                },
+                output_uri=job_cfg["output_uri"],
+                dataset={"format": "prompt_completion_jsonl"},
+                budget={
+                    "max_steps": job_cfg["max_steps"],
+                    "tokens_per_update": engine_cfg.get("tokens_per_update", 2048),
+                    "publish_every_steps": 1,
+                },
+                scheduling={"min_tokens_per_train_quantum": 1, "min_hot_steps": 0},
+            )
+            ray.get(controller.submit_job.remote(spec))
+            examples = build_sft_examples(
+                job_id=name,
+                records=job_cfg["records"],
+                dataset=dataset_spec,
+                encode=encode,
+                eos_id=eos_id,
+                max_length=engine_cfg.get("max_seq_len"),
+            )
+            tokens = example_store.put_many(name, examples)
+            ray.get(controller.mark_train_batch_ready.remote(name, f"{name}-sft", tokens))
+
+        runner = ContinuousTrainingRunner(
+            self.args,
+            controller,
+            scheduler,
+            trajectory_store,
+            example_store,
+            None,  # checkpoint_store unused (no preemption in this path)
+            model=self.model,
+            optimizer=self.optimizer,
+            opt_scheduler=self.opt_param_scheduler,
+        )
+        return runner.run_bounded(engine_cfg.get("max_engine_steps", 200))
+
     def load_pending_adapters(self) -> int:
         if not is_multi_lora_enabled(self.args):
             return 0
