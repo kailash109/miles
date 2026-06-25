@@ -335,16 +335,21 @@ class SGLangEngine(RayActor):
     def load_lora_adapter_from_tensors(
         self,
         lora_name: str,
-        serialized_tensors: str,
+        serialized_named_tensors: list[str],
         config_dict: dict,
         load_format: str | None = None,
         pinned: bool = False,
         added_tokens_config: dict | None = None,
     ):
-        """Load a LoRA adapter from serialized tensor data."""
+        """Load a LoRA adapter from serialized tensor data.
+
+        ``serialized_named_tensors`` holds one serialized blob per inference TP
+        rank; the server picks its own via ``serialized_named_tensors[tp_rank]``,
+        matching the ``update_weights_from_tensor`` convention.
+        """
         payload = {
             "lora_name": lora_name,
-            "serialized_tensors": serialized_tensors,
+            "serialized_named_tensors": serialized_named_tensors,
             "config_dict": config_dict,
             "pinned": pinned,
         }

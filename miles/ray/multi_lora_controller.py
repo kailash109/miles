@@ -200,6 +200,10 @@ class MultiLoRAController:
             else:
                 self.drain_until_rollout_id[name] = rollout_id
 
+    # Update the latest rollout generation id that started generating
+    def report_generation_started(self, rollout_id: int) -> None:
+        self.last_started_rollout_id = max(rollout_id, self.last_started_rollout_id)
+
     # Update the latest rollout generation id completed
     def report_training_completed(self, rollout_id: int) -> None:
         self.last_trained_rollout_id = max(rollout_id, self.last_trained_rollout_id)

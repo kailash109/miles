@@ -1,0 +1,8 @@
+name: dapo-math-17k
+rank: 16
+alpha: 16
+data: /root/dapo-math-17k/dapo-math-17k.jsonl
+input_key: prompt
+label_key: label
+rm_type: math
+num_row: 17000

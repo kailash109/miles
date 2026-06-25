@@ -50,6 +50,8 @@ class MultiLoRADataSource(DataSource):
         adapter_args.input_key = config.input_key or self.args.input_key
         adapter_args.label_key = config.label_key or self.args.label_key
         adapter_args.metadata_key = config.metadata_key or self.args.metadata_key
+        if config.seed is not None:
+            adapter_args.rollout_seed = config.seed
         return RolloutDataSource(adapter_args)
 
     def get_samples(self, num_samples: int) -> list[list[Sample]]:

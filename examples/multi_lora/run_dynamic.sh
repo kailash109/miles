@@ -1,9 +1,10 @@
 #!/bin/bash
-# Multi-LoRA training: two math adapters on Qwen2.5-0.5B
+# Timed multi-LoRA submission: a persistent trainer starts first, then adapters
+# in examples/multi_lora/adapters are submitted one at a time on a timer.
 #
-# Datasets:
-#   - GSM8K (grade school math): https://huggingface.co/datasets/openai/gsm8k
-#   - DAPO-Math-17k (competition math): https://huggingface.co/datasets/BytedTsinghua/DAPO-Math-17k
+# Tune the timer via the runtime-env env_vars below:
+#   MULTI_LORA_SUBMIT_INITIAL_S   delay before the first submission
+#   MULTI_LORA_SUBMIT_INTERVAL_S  seconds between submissions
 
 set -ex
 
@@ -22,10 +23,12 @@ ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json='{
      "env_vars": {
         "PYTHONPATH": "/root/Megatron-LM",
-        "CUDA_DEVICE_MAX_CONNECTIONS": "1"
+        "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+        "MULTI_LORA_SUBMIT_INITIAL_S": "30",
+        "MULTI_LORA_SUBMIT_INTERVAL_S": "60"
      }
    }' \
-   -- python3 examples/multi_lora/train_multi_lora.py \
+   -- python3 examples/multi_lora/train_multi_lora_timed.py \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node $GPUS_PER_NODE \
    --colocate \
@@ -91,4 +94,4 @@ ray job submit --address="http://127.0.0.1:8265" \
    --use-wandb \
    --wandb-host https://wandb.ai/ \
    --wandb-project "miles-multilora-default" \
-   --wandb-group "qwen3-4B-test"
+   --wandb-group "qwen3-4B-timed"

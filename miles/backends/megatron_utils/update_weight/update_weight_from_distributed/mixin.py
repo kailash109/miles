@@ -394,11 +394,15 @@ class DistBucketedWeightUpdateMixin:
             },
             output_str=True,
         )
+        # The server picks its shard via ``serialized_named_tensors[tp_rank]`` and
+        # the LoRA module re-shards internally, so every inference TP rank receives
+        # the same full adapter blob.
+        serialized_named_tensors = [serialized] * self.args.rollout_num_gpus_per_engine
         return [
             engine.load_lora_adapter_from_tensors.remote(
                 lora_name=adapter_name,
                 config_dict=lora_config,
-                serialized_tensors=serialized,
+                serialized_named_tensors=serialized_named_tensors,
                 load_format="flattened_bucket",
             )
             for engine in self.rollout_engines

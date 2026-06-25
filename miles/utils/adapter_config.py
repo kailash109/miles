@@ -45,6 +45,11 @@ class AdapterConfig:
     label_key: str | None = None
     metadata_key: str | None = None
 
+    # Per-adapter dataset shuffle seed. When set, overrides the global
+    # --rollout-seed for this adapter's data source so adapters sharing a
+    # dataset draw different sample orderings.
+    seed: int | None = None
+
     rm_type: str | None = None
     custom_rm_path: str | None = None
 
@@ -69,6 +74,7 @@ def parse_adapter_yaml(path: Path) -> AdapterConfig:
         input_key=raw.get("input_key", "text"),
         label_key=raw.get("label_key"),
         metadata_key=raw.get("metadata_key"),
+        seed=raw.get("seed"),
         rm_type=raw.get("rm_type"),
         custom_rm_path=raw.get("custom_rm_path"),
         num_epoch=raw.get("num_epoch"),

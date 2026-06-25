@@ -427,7 +427,9 @@ def _send_to_colocated_engine(
                 ipc_engine.load_lora_adapter_from_tensors.remote(
                     lora_name=lora_name,
                     config_dict=lora_config,
-                    serialized_tensors=serialized_named_tensors[0][0],
+                    # One serialized blob per producer rank (== inference TP rank).
+                    # LoRA currently assumes a single dtype, so take dtype index 0.
+                    serialized_named_tensors=[tensors[0] for tensors in serialized_named_tensors],
                     load_format="flattened_bucket",
                 )
             )
