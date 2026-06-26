@@ -111,7 +111,7 @@ async def _setup(args):
         limits=QueueLimits(),
         adapter_store=ADAPTER_STORE,
     )
-    return actor_model, coordinator, generator, rollout_manager
+    return actor_model, coordinator, generator, rollout_manager, _legacy_controller
 
 
 # Serializes every update_weights() call (background loop + on-demand /sync_weights)
@@ -235,7 +235,7 @@ def _run_training_loop(
 
 def main() -> None:
     args = parse_args()
-    actor_model, coordinator, generator, rollout_manager = asyncio.run(_setup(args))
+    actor_model, coordinator, generator, rollout_manager, controller = asyncio.run(_setup(args))
 
     # Adapter names currently loaded in sglang; shared between the train loop
     # (writer) and the /sample handler (reader) so sampling routes to an adapter
@@ -261,6 +261,7 @@ def main() -> None:
         )
 
     print(f"[engine] serving training API on http://{API_HOST}:{API_PORT} (base_model={args.hf_checkpoint})", flush=True)
+    print(f"[engine] controller: {controller}", flush=True)
     print(
         f"[engine] coordinator ready for jobs (base_model={args.hf_checkpoint}, "
         f"slots={args.multi_lora_n_adapters}, generation={'on' if generator is not None else 'off'})",
