@@ -142,6 +142,10 @@ class RayTrainGroup:
         """Initialize the plan executor on every worker."""
         return await self._broadcast("prepare_training_engine_worker", engine_cfg)
 
+    async def wait_adapter_persisted(self, job_id: str) -> list:
+        """Block until every worker's inference adapter write for ``job_id`` flushes."""
+        return await self._broadcast("wait_adapter_persisted", job_id)
+
     def execute_train_step_plan(self, plan_ref):
         """Dispatch one TrainStepPlan to every worker; return result ObjectRefs.
 

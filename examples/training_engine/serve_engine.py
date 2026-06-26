@@ -37,10 +37,15 @@ API_HOST = os.environ.get("ENGINE_API_HOST", "0.0.0.0")
 API_PORT = int(os.environ.get("ENGINE_API_PORT", "8000"))
 ENABLE_GENERATION = os.environ.get("ENGINE_ENABLE_GENERATION", "0") == "1"
 SYNC_EVERY = max(1, int(os.environ.get("ENGINE_SYNC_EVERY", "1")))
+# Persistent HF-PEFT adapter store (disk-load into sglang for paged-out jobs).
+ADAPTER_STORE = os.environ.get("ENGINE_ADAPTER_STORE") or None
 
 
 async def _setup(args):
-    """Bring up coordinator + workers (+ optional sglang). Returns (actor_model, coordinator, generator)."""
+    """Bring up coordinator + workers (+ optional sglang).
+
+    Returns (actor_model, coordinator, generator, rollout_manager).
+    """
     configure_logger()
 
     if ENABLE_GENERATION and args.colocate:
@@ -97,13 +102,16 @@ async def _setup(args):
         print(f"[engine] generation enabled; router=http://{router_ip}:{router_port}", flush=True)
 
     n_slots = args.multi_lora_n_adapters
+    if ADAPTER_STORE:
+        os.makedirs(ADAPTER_STORE, exist_ok=True)
     coordinator = make_training_coordinator(
         base_model=args.hf_checkpoint,
         max_hot_slots=n_slots,
         batching=BatchingPolicy(max_adapters_per_step=n_slots),
         limits=QueueLimits(),
+        adapter_store=ADAPTER_STORE,
     )
-    return actor_model, coordinator, generator
+    return actor_model, coordinator, generator, rollout_manager
 
 
 # Serializes every update_weights() call (background loop + on-demand /sync_weights)
@@ -149,24 +157,44 @@ def _sync_adapters_to_sglang(actor_model, coordinator, loaded: set) -> None:
             loaded.add(name)
 
 
-def _sync_one_job(actor_model, coordinator, loaded: set, job_id: str) -> int | None:
-    """Synchronously force one job's current adapter into sglang. Returns the
-    published ``adapter_version`` once loaded, or None if the job isn't resident
-    (not yet trained, or paged out). This is the ``save_weights`` primitive: after
-    it returns, ``/sample`` for this job routes to its trained adapter.
+def _sync_one_job(actor_model, coordinator, rollout_manager, loaded: set, job_id: str) -> int | None:
+    """Synchronously force one job's current adapter into sglang (``save_weights``).
+
+    HOT job  -> GPU tensor push (freshest weights from the model slot).
+    COLD job -> flush the inference write + load the persisted HF-PEFT from disk.
+    Returns the adapter_version once loaded, or None if it can't be served (e.g.
+    never trained / never persisted).
     """
     from miles.ray.multi_lora_controller import get_multi_lora_controller
 
     info = ray.get(coordinator.hot_adapter.remote(job_id))
-    if info is None:
+    if info is not None:
+        controller = get_multi_lora_controller()
+        with _WEIGHT_SYNC_LOCK:
+            ray.get(controller.set_engine_adapter.remote(info["name"], info["rank"], info["alpha"], info["slot"]))
+            asyncio.run(actor_model.update_weights())
+            loaded.add(info["name"])
+        print(f"[engine] synced HOT adapter {info['name']} (v{info['version']}) into sglang", flush=True)
+        return int(info["version"])
+
+    # COLD: serve from the persistent adapter store (disk-load).
+    if not ADAPTER_STORE or rollout_manager is None:
         return None
-    controller = get_multi_lora_controller()
+    try:
+        job = ray.get(coordinator.get_job.remote(job_id))
+    except KeyError:
+        return None
+    name = job.spec.adapter.name
+    path = f"{ADAPTER_STORE.rstrip('/')}/{job_id}"
+    # Ensure the eviction write for this job has flushed before we read it.
+    asyncio.run(actor_model.wait_adapter_persisted(job_id))
+    if not os.path.exists(os.path.join(path, "adapter_model.safetensors")):
+        return None  # never persisted (e.g. never evicted while dirty)
     with _WEIGHT_SYNC_LOCK:
-        ray.get(controller.set_engine_adapter.remote(info["name"], info["rank"], info["alpha"], info["slot"]))
-        asyncio.run(actor_model.update_weights())
-        loaded.add(info["name"])
-    print(f"[engine] synced adapter {info['name']} (v{info['version']}) into sglang on demand", flush=True)
-    return int(info["version"])
+        ray.get(rollout_manager.load_lora_adapter_on_engines.remote(name, path))
+        loaded.add(name)
+    print(f"[engine] disk-loaded COLD adapter {name} (v{job.latest_published_version}) from {path}", flush=True)
+    return int(job.latest_published_version)
 
 
 def _run_training_loop(
@@ -207,7 +235,7 @@ def _run_training_loop(
 
 def main() -> None:
     args = parse_args()
-    actor_model, coordinator, generator = asyncio.run(_setup(args))
+    actor_model, coordinator, generator, rollout_manager = asyncio.run(_setup(args))
 
     # Adapter names currently loaded in sglang; shared between the train loop
     # (writer) and the /sample handler (reader) so sampling routes to an adapter
@@ -228,7 +256,9 @@ def main() -> None:
     # On-demand "save weights": force a specific job's adapter into sglang.
     sync_weights_fn = None
     if generator is not None:
-        sync_weights_fn = lambda job_id: _sync_one_job(actor_model, coordinator, loaded_adapters, job_id)  # noqa: E731
+        sync_weights_fn = lambda job_id: _sync_one_job(  # noqa: E731
+            actor_model, coordinator, rollout_manager, loaded_adapters, job_id
+        )
 
     print(f"[engine] serving training API on http://{API_HOST}:{API_PORT} (base_model={args.hf_checkpoint})", flush=True)
     print(

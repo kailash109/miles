@@ -499,7 +499,14 @@ class MegatronTrainRayActor(TrainRayActor):
         The central coordinator owns all scheduling/state; the worker only
         executes the immutable TrainStepPlans it is handed.
         """
+        from miles.training_engine.adapter_writer import AdapterWriter
         from miles.training_engine.megatron_executor import MegatronPlanExecutor
+
+        # Coalescing writer + HF iterator for inference adapter persistence on
+        # eviction. The iterator is the same Megatron->HF LoRA converter the weight
+        # updater uses (present in multi-LoRA generation runs).
+        self._adapter_writer = AdapterWriter(self.args)
+        hf_iterator = getattr(getattr(self, "weight_updater", None), "_hf_weight_iterator", None)
 
         self._plan_executor = MegatronPlanExecutor(
             args=self.args,
@@ -507,10 +514,20 @@ class MegatronTrainRayActor(TrainRayActor):
             optimizer=self.optimizer,
             opt_param_scheduler=self.opt_param_scheduler,
             tokenizer=self.tokenizer,
+            writer=self._adapter_writer,
+            hf_iterator=hf_iterator,
         )
         self._current_plan_id = None
         rank = dist.get_rank() if dist.is_initialized() else 0
         return {"rank": rank, "ok": True}
+
+    def wait_adapter_persisted(self, job_id: str, timeout: float = 120.0) -> bool:
+        """Block until the inference adapter write for ``job_id`` has flushed to
+        disk (used by the save_weights cold-path before sglang loads it)."""
+        writer = getattr(self, "_adapter_writer", None)
+        if writer is None:
+            return True
+        return bool(writer.flush(job_id, timeout=timeout))
 
     def execute_train_step_plan(self, plan):
         """Execute one immutable TrainStepPlan (Ray dereferences the plan arg)."""

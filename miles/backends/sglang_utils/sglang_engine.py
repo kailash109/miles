@@ -434,6 +434,18 @@ class SGLangEngine(RayActor):
             {"lora_name": lora_name},
         )
 
+    def load_lora_adapter(self, lora_name: str, lora_path: str):
+        """Load a LoRA adapter from a directory on disk (HF PEFT format).
+
+        Unlike ``load_lora_adapter_from_tensors`` (which pushes GPU tensors), this
+        has sglang read the adapter from ``lora_path`` itself, so the adapter need
+        not be resident on the training GPU.
+        """
+        return self._make_request(
+            "load_lora_adapter",
+            {"lora_name": lora_name, "lora_path": lora_path},
+        )
+
     def release_memory_occupation(self, tags: list[str] = None):
         """Release memory occupation. Available tags: weights, kv_cache."""
         self.flush_cache()
@@ -519,6 +531,8 @@ class SGLangEngine(RayActor):
         response = requests.post(f"http://{self.server_host}:{self.server_port}/continue_generation", json={})
         response.raise_for_status()
         return response
+
+
 
     def post_process_weights(
         self,

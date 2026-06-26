@@ -94,12 +94,17 @@ image = (
 
 # ── Volumes (reuse the multi_lora assets cache) ──────────────────────────────
 
+ADAPTER_STORE_PATH = "/adapter_store"
+
 assets_volume = modal.Volume.from_name("miles-multilora-assets", create_if_missing=True)
 hf_cache_volume = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
+# Persistent store for HF-PEFT adapters so paged-out jobs are still servable.
+adapter_store_volume = modal.Volume.from_name("miles-engine-adapter-store", create_if_missing=True)
 
 volumes = {
     ASSETS_PATH: assets_volume,
     "/root/.cache/huggingface": hf_cache_volume,
+    ADAPTER_STORE_PATH: adapter_store_volume,
 }
 
 app = modal.App("miles-training-engine-serve")
@@ -151,6 +156,8 @@ def _run_demo(mode: str, wait_seconds: int, num_clients: int, n_adapters: int, a
         "ENGINE_N_ADAPTERS": str(n_adapters),
         "ENGINE_ENABLE_GENERATION": enable_generation,
     }
+    if mode == "rl":
+        server_env["ENGINE_ADAPTER_STORE"] = ADAPTER_STORE_PATH
     print(f"Starting engine server (mode={mode}, port={api_port}, slots={n_adapters}) ...", flush=True)
     server = subprocess.Popen(["bash", str(serve_script)], cwd=MILES_ROOT, env=server_env)
 

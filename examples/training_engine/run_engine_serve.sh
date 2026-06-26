@@ -47,7 +47,8 @@ ray job submit --address="http://127.0.0.1:8265" \
         \"ENGINE_API_PORT\": \"${ENGINE_API_PORT}\",
         \"ENGINE_N_ADAPTERS\": \"${ENGINE_N_ADAPTERS}\",
         \"ENGINE_ENABLE_GENERATION\": \"${ENGINE_ENABLE_GENERATION}\",
-        \"ENGINE_SYNC_EVERY\": \"${ENGINE_SYNC_EVERY:-1}\"
+        \"ENGINE_SYNC_EVERY\": \"${ENGINE_SYNC_EVERY:-1}\",
+        \"ENGINE_ADAPTER_STORE\": \"${ENGINE_ADAPTER_STORE:-}\"
      }
    }" \
    -- python3 examples/training_engine/serve_engine.py \

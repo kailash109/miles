@@ -192,6 +192,9 @@ class TrainingJobRuntime:
     last_ready_at: float | None = None
     last_error: str | None = None
     last_loss: float | None = None
+    # optimizer_step last persisted to disk (training ckpt + HF-PEFT) on eviction
+    # (-1 = never). Skips rewriting an unchanged adapter.
+    persisted_step: int = -1
 
     @property
     def job_id(self) -> str:

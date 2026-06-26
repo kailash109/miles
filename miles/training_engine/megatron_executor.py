@@ -94,12 +94,12 @@ def make_continuous_forward_step(loss_type: str, job_specs: dict, per_token_loss
 
 
 class MegatronPlanExecutor:
-    def __init__(self, args, model, optimizer, opt_param_scheduler, tokenizer=None):
+    def __init__(self, args, model, optimizer, opt_param_scheduler, tokenizer=None, *, writer=None, hf_iterator=None):
         self.args = args
         self.model = model
         self.optimizer = optimizer
         self.opt_param_scheduler = opt_param_scheduler
-        self.slot_executor = AdapterSlotExecutor(args, model, optimizer)
+        self.slot_executor = AdapterSlotExecutor(args, model, optimizer, writer=writer, hf_iterator=hf_iterator)
         self.materializer = BatchMaterializer(args, tokenizer)
 
     def execute(self, plan: TrainStepPlan) -> WorkerStepResult:

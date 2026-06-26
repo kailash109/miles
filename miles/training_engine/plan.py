@@ -18,6 +18,14 @@ class SlotPreemption:
     job_id: str
     slot: int
     checkpoint_uri: str
+    # Unified eviction export: persist only if the adapter changed since its last
+    # disk write (dirty). When True the worker writes the training checkpoint AND
+    # (if inference_uri set) the HF-PEFT adapter, from one slot snapshot.
+    persist: bool = True
+    inference_uri: str | None = None
+    rank: int = 0
+    alpha: int = 0
+    target_modules: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

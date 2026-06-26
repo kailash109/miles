@@ -29,11 +29,15 @@ from .plan import SlotOnload, SlotPreemption, TrainStepPlan
 
 
 class AdapterSlotExecutor:
-    def __init__(self, args, model, optimizer):
+    def __init__(self, args, model, optimizer, *, writer=None, hf_iterator=None):
         self.args = args
         self.model = model
         self.optimizer = optimizer
         self.checkpoint_store = CheckpointStore()
+        # Inference persistence (generation mode only): the coalescing writer and
+        # the HF weight iterator used to export a slot to HF-PEFT.
+        self.writer = writer
+        self.hf_iterator = hf_iterator
 
     def prepare_slots(self, plan: TrainStepPlan) -> None:
         for op in plan.preemptions:
@@ -44,6 +48,10 @@ class AdapterSlotExecutor:
     def load(self, op: SlotOnload) -> None:
         init_adapter_slot(self.model, op.slot, rank=op.rank, alpha=op.alpha)
         if op.source_uri:
+            # Ensure any in-flight inference write for this job has flushed so the
+            # training checkpoint we read back is complete/consistent.
+            if self.writer is not None:
+                self.writer.flush(op.job_id)
             state = self.checkpoint_store.load_training_checkpoint(op.source_uri)
             if "adapter_megatron" in state:
                 load_adapter(self.model, op.slot, state["adapter_megatron"])
@@ -54,13 +62,31 @@ class AdapterSlotExecutor:
         self.optimizer.reload_model_params()
 
     def checkpoint_and_clear(self, op: SlotPreemption) -> None:
-        adapter_state = self.checkpoint_store.extract_megatron_adapter_state(
-            model=self.model, slot=op.slot
-        )
-        optimizer_state = capture_optimizer_state_for_adapter(self.optimizer, self.model, op.slot)
-        self.checkpoint_store.write_training_checkpoint_to(
-            op.checkpoint_uri, adapter_state=adapter_state, optimizer_state=optimizer_state
-        )
+        # Single eviction export, gated by the coordinator's dirty check: persist
+        # only if the adapter changed since its last disk write.
+        if op.persist:
+            adapter_state = self.checkpoint_store.extract_megatron_adapter_state(
+                model=self.model, slot=op.slot
+            )
+            optimizer_state = capture_optimizer_state_for_adapter(self.optimizer, self.model, op.slot)
+            # Training checkpoint (Megatron + optimizer) is written synchronously —
+            # training resume depends on it being durable.
+            self.checkpoint_store.write_training_checkpoint_to(
+                op.checkpoint_uri, adapter_state=adapter_state, optimizer_state=optimizer_state
+            )
+            # Inference HF-PEFT: snapshot now (slot still live), write async.
+            if op.inference_uri and self.writer is not None and self.hf_iterator is not None:
+                from .adapter_export import capture_slot_hf_cpu
+
+                hf_tensors = capture_slot_hf_cpu(self.hf_iterator, self.model, op.slot, op.rank)
+                self.writer.submit(
+                    op.job_id,
+                    op.inference_uri,
+                    hf_tensors,
+                    rank=op.rank,
+                    alpha=op.alpha,
+                    target_modules=op.target_modules,
+                )
         clear_adapter_slot(self.model, op.slot)
         zero_optimizer_state_for_adapter(self.optimizer, self.model, op.slot)
         self.optimizer.reload_model_params()

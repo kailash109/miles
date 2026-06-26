@@ -429,6 +429,17 @@ class RolloutManager:
         """All node-0 engines across all servers / models."""
         return [e for srv in self.servers.values() for e in srv.engines]
 
+    def load_lora_adapter_on_engines(self, lora_name: str, lora_path: str):
+        """Load a LoRA adapter from disk (HF-PEFT) into every rollout engine.
+
+        Used by the training-engine save_weights cold-path to serve a paged-out
+        adapter without it being resident on the training GPU.
+        """
+        engines = self.rollout_engines
+        if not engines:
+            return []
+        return ray.get([e.load_lora_adapter.remote(lora_name, lora_path) for e in engines])
+
     def get_updatable_engines_and_lock(self):
         """Return engines eligible for weight updates."""
         srv = self._get_updatable_server()

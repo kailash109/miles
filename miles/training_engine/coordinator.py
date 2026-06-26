@@ -58,9 +58,12 @@ class TrainingCoordinator:
         limits: QueueLimits | None = None,
         batch_store: BatchStore | None = None,
         artifact_store: ArtifactStore | None = None,
+        adapter_store: str | None = None,
     ):
         self.base_model = base_model
         self.max_hot_slots = max_hot_slots
+        # Root dir for persisted HF-PEFT adapters (inference disk-load); None disables.
+        self.adapter_store = adapter_store
         self.batching = batching or BatchingPolicy()
         self.limits = limits or QueueLimits()
         self.batch_store = batch_store or BatchStore()
@@ -183,7 +186,7 @@ class TrainingCoordinator:
         preemptions, onloads, job_to_slot = self._assign_slots(selected)
 
         print(f"[coordinator] job_to_slot: {job_to_slot}", flush=True)
-        
+
         selected = [s for s in selected if s.job_id in job_to_slot]
         if not selected:
             return None
@@ -274,11 +277,23 @@ class TrainingCoordinator:
                     continue
                 chosen_victim_ids.add(victim.job_id)
                 slot = victim.slot
+                # Persist only if the adapter changed since its last disk write.
+                persist = victim.optimizer_step > victim.persisted_step
+                inference_uri = (
+                    f"{self.adapter_store.rstrip('/')}/{victim.job_id}"
+                    if (self.adapter_store and persist)
+                    else None
+                )
                 preemptions.append(
                     SlotPreemption(
                         job_id=victim.job_id,
                         slot=slot,
                         checkpoint_uri=self._internal_checkpoint_uri(victim),
+                        persist=persist,
+                        inference_uri=inference_uri,
+                        rank=victim.spec.adapter.rank,
+                        alpha=victim.spec.adapter.alpha,
+                        target_modules=tuple(victim.spec.adapter.target_modules),
                     )
                 )
 
@@ -375,6 +390,9 @@ class TrainingCoordinator:
             victim.residency = Residency.COLD
             victim.slot = None
             victim.cold_checkpoint_uri = op.checkpoint_uri
+            if op.persist:
+                # The worker wrote the training ckpt + HF adapter for this step.
+                victim.persisted_step = victim.optimizer_step
             victim.hot_since_engine_step = None
             victim.consecutive_steps = 0
             self.slot_owner.pop(op.slot, None)
