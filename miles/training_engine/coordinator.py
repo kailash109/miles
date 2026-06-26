@@ -171,6 +171,8 @@ class TrainingCoordinator:
             token_budget=self.batching.max_train_tokens_per_step,
             max_adapters=self.batching.max_adapters_per_step,
         )
+        print(f"[coordinator] selected jobs: {selected}", flush=True)
+
         if not selected:
             return None
 
@@ -179,6 +181,9 @@ class TrainingCoordinator:
 
         plan_id = new_plan_id()
         preemptions, onloads, job_to_slot = self._assign_slots(selected)
+
+        print(f"[coordinator] job_to_slot: {job_to_slot}", flush=True)
+        
         selected = [s for s in selected if s.job_id in job_to_slot]
         if not selected:
             return None
@@ -324,12 +329,19 @@ class TrainingCoordinator:
         self.batch_store.commit_plan(plan_id)
         self.engine_step += 1
 
+        # Step-aggregate loss (batch-mean over all jobs this step); the workers
+        # all-reduce it across DP, so any ok result carries the same value.
+        step_metrics = next((r.metrics for r in results if r.metrics), {})
+        step_loss = step_metrics.get("loss")
+
         for job_id in plan.selected_jobs:
             job = self.jobs[job_id]
             trained = sum(l.token_count for l in plan.leases.get(job_id, ()))
             job.optimizer_step += 1
             job.trained_steps += 1
             job.trained_tokens += trained
+            if step_loss is not None:
+                job.last_loss = float(step_loss)
             job.ready_train_tokens = max(0, job.ready_train_tokens - trained)
             job.deficit_tokens -= trained
             job.consecutive_steps += 1
@@ -428,6 +440,43 @@ class TrainingCoordinator:
 
     def snapshot_jobs(self) -> dict[str, TrainingJobRuntime]:
         return dict(self.jobs)
+
+    def hot_adapter(self, job_id: str) -> dict | None:
+        """Resident-adapter info for one job, or None if it isn't HOT.
+
+        Used by the synchronous save/sync path: only a HOT job has its adapter
+        weights live in a model slot to push into sglang.
+        """
+        job = self.jobs.get(job_id)
+        if job is None or job.residency != Residency.HOT or job.slot is None:
+            return None
+        return {
+            "name": job.spec.adapter.name,
+            "slot": job.slot,
+            "rank": job.spec.adapter.rank,
+            "alpha": job.spec.adapter.alpha,
+            "version": job.latest_published_version,
+        }
+
+    def hot_adapters(self) -> list[dict]:
+        """Resident (HOT) adapters and their physical slots, for syncing into the
+        inference engine (the bridge to ``multi_lora_controller`` / sglang).
+
+        Each entry's ``slot`` is the model's MultiLoRALinear slot where this job's
+        trained adapter weights live, so the weight updater can expose + push it.
+        """
+        out = []
+        for job in self.jobs.values():
+            if job.residency == Residency.HOT and job.slot is not None:
+                out.append(
+                    {
+                        "name": job.spec.adapter.name,
+                        "slot": job.slot,
+                        "rank": job.spec.adapter.rank,
+                        "alpha": job.spec.adapter.alpha,
+                    }
+                )
+        return out
 
     def get_job(self, job_id: str) -> TrainingJobRuntime:
         return self.jobs[job_id]

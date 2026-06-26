@@ -8,7 +8,7 @@ imported directly from their submodules inside the training process.
 """
 
 from .batch_store import BatchStore
-from .client import TrainingClient, build_job_spec
+from .client import LoraTrainingClient, ServiceClient, TrainingClient, build_job_spec
 from .coordinator import TrainingCoordinator, make_training_coordinator
 from .plan import BatchLease, ExportRequest, SlotOnload, SlotPreemption, TrainStepPlan
 from .results import (
@@ -43,6 +43,8 @@ from .schemas import (
 __all__ = [
     "BatchStore",
     "TrainingClient",
+    "ServiceClient",
+    "LoraTrainingClient",
     "build_job_spec",
     "TrainingCoordinator",
     "make_training_coordinator",

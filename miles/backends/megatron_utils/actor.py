@@ -1,6 +1,8 @@
+import contextlib
 import logging
 import random
 import socket
+import time
 from argparse import Namespace
 from contextlib import nullcontext
 
@@ -48,6 +50,17 @@ logging.getLogger("megatron").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
+@contextlib.contextmanager
+def _phase(name: str):
+    """Timestamped start/end marker for startup profiling (forwarded to job logs)."""
+    t0 = time.time()
+    print(f"[startup:actor] {name} ...", flush=True)
+    try:
+        yield
+    finally:
+        print(f"[startup:actor] {name} done in {time.time() - t0:.1f}s", flush=True)
+
+
 class MegatronTrainRayActor(TrainRayActor):
     @with_defer(lambda: Timer().start("train_wait"))
     def init(
@@ -60,7 +73,8 @@ class MegatronTrainRayActor(TrainRayActor):
 
         super().init(args, role, with_ref)
 
-        init(args)
+        with _phase("megatron init(args) (distributed/CUDA init)"):
+            init(args)
 
         if args.dumper_enable:
             from sglang.srt.debug_utils.dumper import dumper
@@ -115,13 +129,15 @@ class MegatronTrainRayActor(TrainRayActor):
         if is_multi_lora_enabled(args):
             from .multi_lora import initialize_multi_lora_model_and_optimizer
 
-            (self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id) = (
-                initialize_multi_lora_model_and_optimizer(args, role)
-            )
+            with _phase("initialize_multi_lora_model_and_optimizer"):
+                (self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id) = (
+                    initialize_multi_lora_model_and_optimizer(args, role)
+                )
         else:
-            (self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id) = (
-                initialize_model_and_optimizer(args, role)
-            )
+            with _phase("initialize_model_and_optimizer"):
+                (self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id) = (
+                    initialize_model_and_optimizer(args, role)
+                )
 
         parallel_state = get_parallel_state()
         if parallel_state.cp.size > 1:
@@ -151,7 +167,8 @@ class MegatronTrainRayActor(TrainRayActor):
             single_tag=None if args.enable_weights_backuper else "actor",
         )
         self._active_model_tag: str | None = "actor"
-        self.weights_backuper.backup("actor")
+        with _phase("weights_backuper.backup(actor)"):
+            self.weights_backuper.backup("actor")
 
         if with_ref:
             self.load_other_checkpoint("ref", args.ref_load)
@@ -180,7 +197,8 @@ class MegatronTrainRayActor(TrainRayActor):
             is_lora=is_lora_enabled(args),
             is_multi_lora=is_multi_lora_enabled(args),
         )
-        self.weight_updater = update_weight_cls(self.args, self.model, **weight_updater_kwargs)
+        with _phase("construct weight_updater"):
+            self.weight_updater = update_weight_cls(self.args, self.model, **weight_updater_kwargs)
 
         # empty cache after initialization
         clear_memory()

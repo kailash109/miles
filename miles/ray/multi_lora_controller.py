@@ -233,6 +233,36 @@ class MultiLoRAController:
         logger.info(f"Removed adapter '{name}' (slot {slot} freed)")
         return slot
 
+    # ---- Engine-managed adapters (training-engine coordinator owns the slots) ----
+    # The continuous training engine assigns its own physical slots, so these
+    # bypass the yaml/free-slot allocator and the rollout-id drain state machine.
+
+    def set_engine_adapter(self, name: str, rank: int, alpha: int, slot: int) -> None:
+        """Register/refresh an engine-managed adapter at an explicit slot as ACTIVE.
+
+        Idempotent: re-calling updates rank/alpha/slot. ``update_weights`` then
+        pushes this adapter's weights (read from model ``slot``) into sglang under
+        ``name``.
+        """
+        self.configs[name] = AdapterConfig(
+            name=name, rank=rank, alpha=alpha, data="", slot=slot, state=AdapterState.ACTIVE
+        )
+        self.free_slots.discard(slot)
+
+    def drain_engine_adapter(self, name: str) -> None:
+        """Mark an engine adapter DRAINED so the next ``update_weights`` unloads it
+        from sglang. Idempotent; safe if unknown."""
+        cfg = self.configs.get(name)
+        if cfg is not None and cfg.state != AdapterState.DRAINED:
+            self.configs[name] = dataclasses.replace(cfg, state=AdapterState.DRAINED)
+
+    def remove_engine_adapter(self, name: str) -> None:
+        """Drop an engine adapter from the registry and free its slot (controller
+        view). Call after ``update_weights`` has unloaded it from sglang."""
+        cfg = self.configs.pop(name, None)
+        if cfg is not None:
+            self.free_slots.add(cfg.slot)
+
     def adapter_configs(self) -> dict[str, AdapterConfig]:
         return dict(self.configs)
 

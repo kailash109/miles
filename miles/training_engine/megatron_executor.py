@@ -82,8 +82,11 @@ def make_continuous_forward_step(loss_type: str, job_specs: dict, per_token_loss
             else:
                 loss = sum_loss / num_tokens
                 normalizer = torch.ones((), dtype=torch.long, device=loss.device)
-            values = torch.stack([num_tokens.detach().float(), loss.detach().float()])
-            return loss, normalizer, {"keys": ["num_tokens", "loss"], "values": values}
+            # Report the token-sum of loss + the token count (count first), so
+            # ``aggregate_train_losses`` yields the mean per-token loss regardless
+            # of the backprop normalization chosen above.
+            report_values = torch.stack([num_tokens.detach().float(), sum_loss.detach().float()])
+            return loss, normalizer, {"keys": ["loss"], "values": report_values}
 
         return logits, loss_func
 
@@ -104,7 +107,23 @@ class MegatronPlanExecutor:
         try:
             self.slot_executor.prepare_slots(plan)
             microbatches = self.materializer.materialize(plan)
+            if rank == 0:
+                total_tokens = sum(int(mb["tokens"].shape[0]) for mb in microbatches)
+                print(
+                    f"[worker] running forward/backward: step={plan.engine_step} "
+                    f"loss={plan.loss_type} jobs={list(plan.selected_jobs)} "
+                    f"slots={plan.job_to_slot} tokens={total_tokens}",
+                    flush=True,
+                )
             metrics = self._train(plan, microbatches)
+            if rank == 0:
+                print(
+                    f"[worker] step={plan.engine_step} done "
+                    f"loss={metrics.get('loss', float('nan')):.4f} "
+                    f"grad_norm={metrics.get('grad_norm', float('nan')):.3f} "
+                    f"jobs={list(plan.selected_jobs)}",
+                    flush=True,
+                )
             written = self.slot_executor.write_dirty_adapter_files(plan)
             return WorkerStepResult(
                 plan_id=plan.plan_id, rank=rank, ok=True, metrics=metrics, written_files=written

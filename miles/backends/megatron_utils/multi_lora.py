@@ -1,5 +1,7 @@
+import contextlib
 import dataclasses
 import logging
+import time
 from argparse import Namespace
 from pathlib import Path
 from typing import Any
@@ -7,6 +9,17 @@ from typing import Any
 import torch
 
 logger = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def _phase(name: str):
+    """Timestamped start/end marker for startup profiling (forwarded to job logs)."""
+    t0 = time.time()
+    print(f"[startup:actor] {name} ...", flush=True)
+    try:
+        yield
+    finally:
+        print(f"[startup:actor] {name} done in {time.time() - t0:.1f}s", flush=True)
 
 
 def is_multi_lora_enabled(args: Namespace) -> bool:
@@ -55,8 +68,10 @@ def build_multi_lora_model(args: Namespace):
     from miles.backends.megatron_utils.bridge_lora_helpers import _make_value_model_hook
 
     hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
-    bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
-    provider = bridge.to_megatron_provider(load_weights=False)
+    with _phase("AutoBridge.from_hf_pretrained"):
+        bridge = AutoBridge.from_hf_pretrained(args.hf_checkpoint, trust_remote_code=True)
+    with _phase("bridge.to_megatron_provider"):
+        provider = bridge.to_megatron_provider(load_weights=False)
 
     provider.tensor_model_parallel_size = args.tensor_model_parallel_size
     provider.pipeline_model_parallel_size = args.pipeline_model_parallel_size
@@ -94,7 +109,8 @@ def build_multi_lora_model(args: Namespace):
         from miles.backends.megatron_utils.lora_utils import patch_param_grad_buffer_for_colocate_mode_lora
         patch_param_grad_buffer_for_colocate_mode_lora()
 
-    model = provider.provide_distributed_model(wrap_with_ddp=True, ddp_config=ddp_config)
+    with _phase("provider.provide_distributed_model"):
+        model = provider.provide_distributed_model(wrap_with_ddp=True, ddp_config=ddp_config)
     return model, multi_lora
 
 
@@ -116,33 +132,36 @@ def initialize_multi_lora_model_and_optimizer(
 
         filesystem_async_module.FileSystemWriterAsync = ROCmFileSystemWriterAsync
 
-    model, multi_lora = build_multi_lora_model(args)
+    with _phase("build_multi_lora_model"):
+        model, multi_lora = build_multi_lora_model(args)
     model[0].role = role
 
-    kwargs = {}
-    for f in dataclasses.fields(OptimizerConfig):
-        if hasattr(args, f.name):
-            kwargs[f.name] = getattr(args, f.name)
-    config = OptimizerConfig(**kwargs)
-    config.timers = None
-    optimizer = get_megatron_optimizer(
-        config=config,
-        model_chunks=model,
-        use_gloo_process_groups=args.enable_gloo_process_groups,
-    )
-    opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
+    with _phase("get_megatron_optimizer"):
+        kwargs = {}
+        for f in dataclasses.fields(OptimizerConfig):
+            if hasattr(args, f.name):
+                kwargs[f.name] = getattr(args, f.name)
+        config = OptimizerConfig(**kwargs)
+        config.timers = None
+        optimizer = get_megatron_optimizer(
+            config=config,
+            model_chunks=model,
+            use_gloo_process_groups=args.enable_gloo_process_groups,
+        )
+        opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
 
     # Hide adapter params so the bridge's conversion-task walk doesn't see them
     # while loading the base checkpoint.
     from megatron.bridge.peft.multi_lora_layers import hide_adapters
 
     clear_memory()
-    with hide_adapters(model):
-        iteration, _ = load_checkpoint(
-            model, optimizer, opt_param_scheduler,
-            checkpointing_context={},
-            skip_load_to_model_and_opt=False,
-        )
+    with _phase("load_checkpoint (bridge HF weight load)"):
+        with hide_adapters(model):
+            iteration, _ = load_checkpoint(
+                model, optimizer, opt_param_scheduler,
+                checkpointing_context={},
+                skip_load_to_model_and_opt=False,
+            )
     check_peak_gpu_memory_after_load(args)
     clear_memory()
     check_model_hashes(args, model, iteration)
@@ -151,7 +170,8 @@ def initialize_multi_lora_model_and_optimizer(
     # Install every adapter the controller already knows about, before the
     # caller's backuper takes its snapshot. See the docstring for why.
     from .update_weight.multi_lora_sync import load_pending_adapters
-    load_pending_adapters(args, model, optimizer)
+    with _phase("load_pending_adapters"):
+        load_pending_adapters(args, model, optimizer)
 
     return model, optimizer, opt_param_scheduler, iteration
 

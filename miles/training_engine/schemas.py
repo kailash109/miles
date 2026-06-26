@@ -1,9 +1,6 @@
-"""Typed contracts for the continuous-batched MultiLoRA training engine (v2).
+"""Typed contracts for the continuous-batched MultiLoRA training engine.
 
-Torch/ray-free so the coordinator, scheduler, batch store, and validation can be
-imported and unit-tested on a CPU-only machine. Job runtime state uses
-*orthogonal* fields (lifecycle / residency / readiness / execution) rather than
-one mixed enum.
+
 """
 
 from __future__ import annotations
@@ -194,6 +191,7 @@ class TrainingJobRuntime:
     cold_checkpoint_uri: str | None = None
     last_ready_at: float | None = None
     last_error: str | None = None
+    last_loss: float | None = None
 
     @property
     def job_id(self) -> str:
@@ -256,6 +254,22 @@ class ExternalTrajectoryBatch:
 
 
 @dataclass
+class PromptBatch:
+    """Prompt-only submission for online RL.
+
+    The client supplies only tokenized prompts; the engine generates rollouts
+    with the job's current adapter (via sglang), returns them to the client to
+    score, and the client resubmits the scored rollouts as an
+    ``ExternalTrajectoryBatch``. Reward computation stays client-side.
+    """
+
+    job_id: str
+    prompts: list[list[int]]  # tokenized prompt token ids, one list per prompt
+    sampling_params: dict[str, Any] = field(default_factory=dict)
+    n_samples_per_prompt: int = 1
+
+
+@dataclass
 class TrainExample:
     """Internal per-sequence training example (SFT and RL normalize to this)."""
 
@@ -269,7 +283,7 @@ class TrainExample:
     loss_mask: list[int]
 
     # Next-token targets (-100 at ignored positions / sequence end). Used by SFT
-    # cross-entropy and by RL current-policy logprob gathering (§13.3).
+    # cross-entropy and by RL current-policy logprob gathering.
     labels: list[int] | None = None
 
     old_logprobs: list[float] | None = None
@@ -339,7 +353,7 @@ class TrajectoryValidationError(ValueError):
 
 
 def validate_trajectory_batch(job: TrainingJobRuntime, batch: ExternalTrajectoryBatch) -> None:
-    """Enforce the disaggregated-RL ingestion contract against the *published* version."""
+    # support disagg inference pipeline
     spec = job.spec
 
     if batch.job_id != spec.job_id:

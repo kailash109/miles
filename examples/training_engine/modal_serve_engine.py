@@ -1,24 +1,23 @@
-"""Oversubscription stress test of the continuous MultiLoRA engine on Modal GPUs.
+"""Serve the continuous MultiLoRA training engine on a Modal GPU and demo clients.
 
-Same image/overlay/volume strategy as ``modal_engine.py``, but launches the
-stress driver, which submits *far* more LoRA jobs (default 50,000) than there are
-GPU slots and lets the central coordinator page them through the resident slots.
-Only ``--multi-lora-n-adapters`` adapters are ever in VRAM, so the engine handles
-a huge job queue without OOM.
+Launches two subprocesses inside one H200 container:
+  1. the engine server  (``run_engine_serve.sh`` -> ``serve_engine.py``), and
+  2. a client runner     (``engine_client_demo.py``) that waits a few minutes for
+     the engine to warm up, then opens a few HTTP clients that each submit a job.
 
 Usage
 -----
-Provision the base model (shared with the multi_lora example; no-op if present)::
+Provision the base model + dataset (shared cache; no-op if present)::
 
-    modal run examples/training_engine/modal_engine_stress.py::provision
+    modal run examples/training_engine/modal_serve_engine.py::provision
 
-Run the stress test (single H200, detached)::
+Serve + run the demo clients (single H200, detached)::
 
-    modal run -d examples/training_engine/modal_engine_stress.py::train
+    modal run -d examples/training_engine/modal_serve_engine.py::demo
 
     # Tune it:
-    modal run -d examples/training_engine/modal_engine_stress.py::train \
-        --num-jobs 50000 --max-steps 400 --n-adapters 16 --examples-per-job 1
+    modal run -d examples/training_engine/modal_serve_engine.py::demo \
+        --wait-seconds 300 --num-clients 3 --n-adapters 16
 """
 
 import os
@@ -47,7 +46,7 @@ ROOT_LINKS = {
 
 DOCKER_IMAGE = "radixark/miles:dev-202606200114"
 
-# ── Image (identical overlay strategy to modal_engine.py) ────────────────────
+# ── Image ────────────────────────────────────────────────────────────────────
 
 image = (
     modal.Image.from_registry(DOCKER_IMAGE)
@@ -103,7 +102,7 @@ volumes = {
     "/root/.cache/huggingface": hf_cache_volume,
 }
 
-app = modal.App("miles-training-engine-stress")
+app = modal.App("miles-training-engine-serve")
 
 
 def _link_assets_into_root() -> None:
@@ -131,6 +130,51 @@ def provision():
     print("Provisioned Qwen3-4B + gsm8k into the assets volume.")
 
 
+def _run_demo(mode: str, wait_seconds: int, num_clients: int, n_adapters: int, api_port: int):
+    """Serve the engine and run a few demo clients against it."""
+    assets_volume.reload()
+    hf_cache_volume.reload()
+    _link_assets_into_root()
+
+    serve_script = Path(MILES_ROOT) / "examples" / "training_engine" / "run_engine_serve.sh"
+    client_script = Path(MILES_ROOT) / "examples" / "training_engine" / "engine_client_demo.py"
+    for p in (serve_script, client_script):
+        if not p.exists():
+            raise FileNotFoundError(f"missing: {p}")
+
+    # 1) Serve the coordinator/engine (background subprocess).
+    enable_generation = "1" if mode == "rl" else "0"
+    server_env = {
+        **os.environ,
+        "ENGINE_API_HOST": "0.0.0.0",
+        "ENGINE_API_PORT": str(api_port),
+        "ENGINE_N_ADAPTERS": str(n_adapters),
+        "ENGINE_ENABLE_GENERATION": enable_generation,
+    }
+    print(f"Starting engine server (mode={mode}, port={api_port}, slots={n_adapters}) ...", flush=True)
+    server = subprocess.Popen(["bash", str(serve_script)], cwd=MILES_ROOT, env=server_env)
+
+    # 2) Client runner: waits for warm-up, then opens a few clients that submit jobs.
+    client_env = {
+        **os.environ,
+        "ENGINE_BASE_URL": f"http://localhost:{api_port}",
+        "ENGINE_CLIENT_WAIT": str(wait_seconds),
+        "ENGINE_NUM_CLIENTS": str(num_clients),
+        "ENGINE_BASE_MODEL": "/root/Qwen3-4B/",
+        "ENGINE_DEMO_MODE": mode,
+    }
+    try:
+        print(f"Client runner will wait {wait_seconds}s, then open {num_clients} clients.", flush=True)
+        subprocess.run(["python3", str(client_script)], cwd=MILES_ROOT, env=client_env, check=True)
+    finally:
+        print("Demo clients finished; stopping engine server.", flush=True)
+        server.terminate()
+        try:
+            server.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            server.kill()
+
+
 @app.function(
     image=image,
     gpu="H200:1",
@@ -138,39 +182,18 @@ def provision():
     timeout=6 * 60 * 60,
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
-def train(
-    num_jobs: int = 50000,
-    max_steps: int = 300,
-    n_adapters: int = 16,
-    examples_per_job: int = 1,
-    log_every: int = 20,
-):
-    """Launch the oversubscription stress run on one H200.
+def demo(wait_seconds: int = 300, num_clients: int = 3, n_adapters: int = 16, api_port: int = 8000):
+    """SFT demo on a single H200 (train-only, no sglang)."""
+    _run_demo("sft", wait_seconds, num_clients, n_adapters, api_port)
 
-    The v0 manifests for 50k jobs are written to fast local disk (not a volume).
-    """
-    assets_volume.reload()
-    hf_cache_volume.reload()
 
-    script_path = Path(MILES_ROOT) / "examples" / "training_engine" / "run_engine_stress.sh"
-    if not script_path.exists():
-        raise FileNotFoundError(f"bash script not found: {script_path}")
-
-    _link_assets_into_root()
-
-    env = {
-        **os.environ,
-        "ENGINE_OUTPUT_ROOT": "/root/stress_artifacts",
-        "ENGINE_NUM_JOBS": str(num_jobs),
-        "ENGINE_MAX_STEPS": str(max_steps),
-        "ENGINE_N_ADAPTERS": str(n_adapters),
-        "ENGINE_EXAMPLES_PER_JOB": str(examples_per_job),
-        "ENGINE_LOG_EVERY": str(log_every),
-    }
-    print(
-        f"Stress run: {num_jobs} jobs -> {n_adapters} slots "
-        f"({num_jobs // max(1, n_adapters)}x oversubscription), max_steps={max_steps}",
-        flush=True,
-    )
-    subprocess.run(["bash", str(script_path)], cwd=MILES_ROOT, env=env, check=True)
-    print("Stress run complete.")
+@app.function(
+    image=image,
+    gpu="H200:2",
+    volumes=volumes,
+    timeout=6 * 60 * 60,
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+)
+def demo_rl(wait_seconds: int = 360, num_clients: int = 3, n_adapters: int = 16, api_port: int = 8000):
+    """Online-RL demo on 2x H200 (disaggregated: 1 trainer GPU + 1 sglang GPU)."""
+    _run_demo("rl", wait_seconds, num_clients, n_adapters, api_port)

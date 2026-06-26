@@ -352,7 +352,7 @@ def train_with_custom_forward_step(
     optimizer.zero_grad()
 
     forward_backward_func = get_forward_backward_func()
-    forward_backward_func(
+    losses_reduced = forward_backward_func(
         forward_step_func=forward_step_func,
         data_iterator=data_iterator,
         model=model,
@@ -370,10 +370,14 @@ def train_with_custom_forward_step(
         model_chunk.zero_grad_buffer()
     optimizer.zero_grad()
 
-    return {
+    metrics = {
         "update_successful": bool(update_successful),
         "grad_norm": float(grad_norm) if grad_norm is not None else 0.0,
     }
+    # Surface the reduced loss (last pipeline stage produces the loss dicts).
+    if losses_reduced:
+        metrics.update({k: float(v) for k, v in aggregate_train_losses(losses_reduced).items()})
+    return metrics
 
 
 def train_one_step(

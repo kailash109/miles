@@ -1,17 +1,33 @@
 #!/bin/bash
-# Oversubscription stress run: submit ENGINE_NUM_JOBS (default 50000) LoRA jobs
-# onto ENGINE_N_ADAPTERS (default 16) GPU slots and let the coordinator page them
-# in/out. Single GPU, TP=1/PP=1. Bounded by ENGINE_MAX_STEPS.
+# Serve the continuous MultiLoRA training engine: start Ray + the coordinator +
+# Megatron workers, then expose the thin HTTP API (serve_engine.py). Clients
+# connect over HTTP and never touch Ray. Single GPU, TP=1/PP=1.
 
 set -ex
+export PS4='+[$(date +%H:%M:%S)] '
 
 export GPUS_PER_NODE=1
-export ENGINE_OUTPUT_ROOT="${ENGINE_OUTPUT_ROOT:-/root/stress_artifacts}"
-export ENGINE_NUM_JOBS="${ENGINE_NUM_JOBS:-50000}"
-export ENGINE_MAX_STEPS="${ENGINE_MAX_STEPS:-300}"
-export ENGINE_EXAMPLES_PER_JOB="${ENGINE_EXAMPLES_PER_JOB:-1}"
-export ENGINE_LOG_EVERY="${ENGINE_LOG_EVERY:-20}"
+export ENGINE_API_HOST="${ENGINE_API_HOST:-0.0.0.0}"
+export ENGINE_API_PORT="${ENGINE_API_PORT:-8000}"
 export ENGINE_N_ADAPTERS="${ENGINE_N_ADAPTERS:-16}"
+export ENGINE_ENABLE_GENERATION="${ENGINE_ENABLE_GENERATION:-0}"
+export ENGINE_SGLANG_ROUTER_PORT="${ENGINE_SGLANG_ROUTER_PORT:-30000}"
+
+# Online-RL generation mode runs DISAGGREGATED: 1 GPU for the Megatron trainer
+# and 1 GPU for the sglang inference engine (no --colocate). Both stay resident
+# (offload defaults off for non-colocate), weights sync over NCCL broadcast, and
+# sglang is always available for /sample. Train-only mode is single-GPU.
+# NOTE: do NOT pass --sglang-router-ip; setting it makes miles assume a router
+# already exists and skip launching one. Pin only the port (deterministic) and
+# let miles start the router on the node IP; serve_engine computes that IP.
+if [ "${ENGINE_ENABLE_GENERATION}" = "1" ]; then
+  TOTAL_GPUS=2
+  MODE_ARGS=(--rollout-num-gpus 1
+             --sglang-router-port "${ENGINE_SGLANG_ROUTER_PORT}")
+else
+  TOTAL_GPUS=1
+  MODE_ARGS=(--debug-train-only)
+fi
 
 pkill sglang || true
 ray stop --force || true
@@ -20,24 +36,24 @@ sleep 3
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 source scripts/models/qwen3-4B.sh
 
-ray start --head --node-ip-address 127.0.0.1 --num-gpus $GPUS_PER_NODE --disable-usage-stats
+ray start --head --node-ip-address 127.0.0.1 --num-gpus $TOTAL_GPUS --disable-usage-stats
 
 ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json="{
      \"env_vars\": {
         \"PYTHONPATH\": \"/root/Megatron-LM\",
         \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
-        \"ENGINE_OUTPUT_ROOT\": \"${ENGINE_OUTPUT_ROOT}\",
-        \"ENGINE_NUM_JOBS\": \"${ENGINE_NUM_JOBS}\",
-        \"ENGINE_MAX_STEPS\": \"${ENGINE_MAX_STEPS}\",
-        \"ENGINE_EXAMPLES_PER_JOB\": \"${ENGINE_EXAMPLES_PER_JOB}\",
-        \"ENGINE_LOG_EVERY\": \"${ENGINE_LOG_EVERY}\"
+        \"ENGINE_API_HOST\": \"${ENGINE_API_HOST}\",
+        \"ENGINE_API_PORT\": \"${ENGINE_API_PORT}\",
+        \"ENGINE_N_ADAPTERS\": \"${ENGINE_N_ADAPTERS}\",
+        \"ENGINE_ENABLE_GENERATION\": \"${ENGINE_ENABLE_GENERATION}\",
+        \"ENGINE_SYNC_EVERY\": \"${ENGINE_SYNC_EVERY:-1}\"
      }
    }" \
-   -- python3 examples/training_engine/engine_stress_driver.py \
+   -- python3 examples/training_engine/serve_engine.py \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node $GPUS_PER_NODE \
-   --debug-train-only \
+   "${MODE_ARGS[@]}" \
    --calculate-per-token-loss \
    ${MODEL_ARGS[@]} \
    \

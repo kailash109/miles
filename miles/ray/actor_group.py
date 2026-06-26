@@ -1,11 +1,24 @@
 import asyncio
+import contextlib
 import os
+import time
 
 import ray
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from miles.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
+
+
+@contextlib.contextmanager
+def _phase(name: str):
+    """Timestamped start/end marker for startup profiling."""
+    t0 = time.time()
+    print(f"[startup] {name} ...", flush=True)
+    try:
+        yield
+    finally:
+        print(f"[startup] {name} done in {time.time() - t0:.1f}s", flush=True)
 
 
 class RayTrainGroup:
@@ -75,15 +88,16 @@ class RayTrainGroup:
             env_vars["TMS_INIT_ENABLE_CPU_BACKUP"] = "1"
 
         backend = self.args.train_backend
-        if backend == "megatron":
-            from miles.backends.megatron_utils.actor import MegatronTrainRayActor
+        with _phase(f"driver import of {backend} actor module (torch/TE/megatron/sglang)"):
+            if backend == "megatron":
+                from miles.backends.megatron_utils.actor import MegatronTrainRayActor
 
-            actor_impl = MegatronTrainRayActor
+                actor_impl = MegatronTrainRayActor
 
-        else:
-            from miles.backends.experimental.fsdp_utils import FSDPTrainRayActor
+            else:
+                from miles.backends.experimental.fsdp_utils import FSDPTrainRayActor
 
-            actor_impl = FSDPTrainRayActor
+                actor_impl = FSDPTrainRayActor
 
         TrainRayActor = ray.remote(num_gpus=1, runtime_env={"env_vars": env_vars})(actor_impl)
 
@@ -100,7 +114,8 @@ class RayTrainGroup:
                 ),
             ).remote(world_size, rank, master_addr, master_port)
             if rank == 0:
-                master_addr, master_port = ray.get(actor.get_master_addr_and_port.remote())
+                with _phase("actor process cold-start + worker-side imports (ray.get rank0)"):
+                    master_addr, master_port = ray.get(actor.get_master_addr_and_port.remote())
             actor_handles.append(actor)
 
         return actor_handles
