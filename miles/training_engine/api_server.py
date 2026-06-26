@@ -3,10 +3,58 @@
 
 from __future__ import annotations
 
+import contextlib
+import threading
 from typing import Any
 
 from .client import build_job_spec
 from .schemas import ExternalTrajectoryBatch, TrainExample
+
+
+class ReadWriteLock:
+    """Writer-preferring read/write lock.
+
+    Online RL has many concurrent ``/sample`` generations (readers) and an
+    occasional weight sync (writer). The writer must pause + flush sglang, which
+    deadlocks if any generation is in flight, so the sync has to wait for all
+    samples to drain and block new ones until it finishes. Writer-preferring so
+    continuous sampling can't starve the sync.
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._readers = 0
+        self._writer_active = False
+        self._writers_waiting = 0
+
+    @contextlib.contextmanager
+    def read_lock(self):
+        with self._cond:
+            while self._writer_active or self._writers_waiting > 0:
+                self._cond.wait()
+            self._readers += 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._readers -= 1
+                if self._readers == 0:
+                    self._cond.notify_all()
+
+    @contextlib.contextmanager
+    def write_lock(self):
+        with self._cond:
+            self._writers_waiting += 1
+            while self._writer_active or self._readers > 0:
+                self._cond.wait()
+            self._writers_waiting -= 1
+            self._writer_active = True
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._writer_active = False
+                self._cond.notify_all()
 
 
 def _train_example_from_dict(job_id: str, ex: dict[str, Any]) -> TrainExample:
@@ -25,7 +73,7 @@ def _train_example_from_dict(job_id: str, ex: dict[str, Any]) -> TrainExample:
     )
 
 
-def build_app(coordinator, generator=None, loaded_adapters=None, sync_weights_fn=None):
+def build_app(coordinator, generator=None, loaded_adapters=None, sync_weights_fn=None, weight_sync_lock=None):
     """Build a FastAPI app exposing the training-engine endpoints over a coordinator.
 
     ``generator`` (a ``SglangGenerator``) enables the online-RL ``/sample``
@@ -36,12 +84,16 @@ def build_app(coordinator, generator=None, loaded_adapters=None, sync_weights_fn
     fresh, untrained adapter whose first rollout is from the initial policy).
     ``sync_weights_fn(job_id) -> version | None`` synchronously forces a job's
     adapter into sglang (the ``save_weights`` primitive) for ``/sync_weights``.
+    ``weight_sync_lock`` (a ``ReadWriteLock``) serializes generation against weight
+    syncs: ``/sample`` holds the read side so a sync (write side) can't pause +
+    flush sglang while a generation is in flight (which would deadlock).
     """
     import ray
     from fastapi import FastAPI, HTTPException
 
     if loaded_adapters is None:
         loaded_adapters = set()
+    sample_lock = weight_sync_lock.read_lock if weight_sync_lock is not None else contextlib.nullcontext
 
     app = FastAPI(title="miles continuous training engine")
 
@@ -94,12 +146,15 @@ def build_app(coordinator, generator=None, loaded_adapters=None, sync_weights_fn
         # sample the base model (the fresh/untrained adapter == base policy).
         adapter_name = job.spec.adapter.name
         lora_path = adapter_name if adapter_name in loaded_adapters else None
-        rollouts = generator.generate(
-            input_ids_list=payload["prompts"],
-            sampling_params=payload.get("sampling_params"),
-            lora_path=lora_path,
-            n_samples_per_prompt=int(payload.get("n_samples_per_prompt", 1)),
-        )
+        # Hold the read side so an in-flight weight sync waits for this generation
+        # to finish (and blocks new ones) before it pauses + flushes sglang.
+        with sample_lock():
+            rollouts = generator.generate(
+                input_ids_list=payload["prompts"],
+                sampling_params=payload.get("sampling_params"),
+                lora_path=lora_path,
+                n_samples_per_prompt=int(payload.get("n_samples_per_prompt", 1)),
+            )
         return {
             "job_id": job_id,
             "adapter_version": job.latest_published_version,
@@ -149,10 +204,15 @@ def serve(
     loaded_adapters=None,
     *,
     sync_weights_fn=None,
+    weight_sync_lock=None,
     host: str = "0.0.0.0",
     port: int = 8000,
 ) -> None:
     """Run the HTTP API for ``coordinator`` (blocking)."""
     import uvicorn
 
-    uvicorn.run(build_app(coordinator, generator, loaded_adapters, sync_weights_fn), host=host, port=port)
+    uvicorn.run(
+        build_app(coordinator, generator, loaded_adapters, sync_weights_fn, weight_sync_lock),
+        host=host,
+        port=port,
+    )

@@ -18,6 +18,16 @@ Serve + run the demo clients (single H200, detached)::
     # Tune it:
     modal run -d examples/training_engine/modal_serve_engine.py::demo \
         --wait-seconds 300 --num-clients 3 --n-adapters 16
+
+Real-math multi-job RL demo (3 GRPO jobs on gsm8k / dapo-math / deepscaler).
+Provision the datasets once, then run for ~50 steps per job (2x H200, detached)::
+
+    modal run examples/training_engine/modal_serve_engine.py::provision_math
+    modal run -d examples/training_engine/modal_serve_engine.py::demo_math_rl
+
+    # Tune it:
+    modal run -d examples/training_engine/modal_serve_engine.py::demo_math_rl \
+        --target-steps 50 --n-samples 8 --prompts-per-iter 8 --max-new-tokens 512
 """
 
 import os
@@ -135,14 +145,60 @@ def provision():
     print("Provisioned Qwen3-4B + gsm8k into the assets volume.")
 
 
-def _run_demo(mode: str, max_wait: int, num_clients: int, n_adapters: int, api_port: int):
+# Real math datasets for the multi-job RL demo (one per client). gsm8k is read
+# locally by the engine server (--prompt-data); all three are loaded by the
+# client via the HF datasets cache (the huggingface-cache volume).
+MATH_RL_DATASETS = [
+    "zhuzilin/gsm8k",
+    "zhuzilin/dapo-math-17k",
+    "agentica-org/DeepScaleR-Preview-Dataset",
+]
+
+
+@app.function(
+    image=image,
+    volumes=volumes,
+    timeout=4 * 60 * 60,
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+)
+def provision_math():
+    """Provision Qwen3-4B + gsm8k (engine) and warm the HF cache for the three
+    math RL datasets (gsm8k, dapo-math-17k, DeepScaleR) used by demo_math_rl."""
+    from datasets import load_dataset
+    from huggingface_hub import snapshot_download
+
+    assets_volume.reload()
+    hf_cache_volume.reload()
+
+    # Base model + gsm8k parquet for the engine server's --prompt-data.
+    snapshot_download("Qwen/Qwen3-4B", local_dir=ROOT_LINKS["Qwen3-4B"])
+    snapshot_download("zhuzilin/gsm8k", repo_type="dataset", local_dir=ROOT_LINKS["gsm8k"])
+    assets_volume.commit()
+
+    # Warm the datasets the client loads via load_dataset() into the HF cache.
+    for repo in MATH_RL_DATASETS:
+        print(f"Warming HF cache for {repo} ...", flush=True)
+        load_dataset(repo, split="train[:2000]")
+    hf_cache_volume.commit()
+    print("Provisioned base model + warmed math RL datasets.")
+
+
+def _run_demo(
+    mode: str,
+    max_wait: int,
+    num_clients: int,
+    n_adapters: int,
+    api_port: int,
+    client_script_name: str = "engine_client_demo.py",
+    extra_client_env = None,
+):
     """Serve the engine and run a few demo clients against it."""
     assets_volume.reload()
     hf_cache_volume.reload()
     _link_assets_into_root()
 
     serve_script = Path(MILES_ROOT) / "examples" / "training_engine" / "run_engine_serve.sh"
-    client_script = Path(MILES_ROOT) / "examples" / "training_engine" / "engine_client_demo.py"
+    client_script = Path(MILES_ROOT) / "examples" / "training_engine" / client_script_name
     for p in (serve_script, client_script):
         if not p.exists():
             raise FileNotFoundError(f"missing: {p}")
@@ -169,6 +225,7 @@ def _run_demo(mode: str, max_wait: int, num_clients: int, n_adapters: int, api_p
         "ENGINE_NUM_CLIENTS": str(num_clients),
         "ENGINE_BASE_MODEL": "/root/Qwen3-4B/",
         "ENGINE_DEMO_MODE": mode,
+        **(extra_client_env or {}),
     }
     try:
         print(f"Client runner: polling until ready (max {max_wait}s), then {num_clients} clients.", flush=True)
@@ -204,3 +261,40 @@ def demo(max_wait: int = 1800, num_clients: int = 3, n_adapters: int = 16, api_p
 def demo_rl(max_wait: int = 1800, num_clients: int = 3, n_adapters: int = 16, api_port: int = 8000):
     """Online-RL demo on 2x H200 (disaggregated: 1 trainer GPU + 1 sglang GPU)."""
     _run_demo("rl", max_wait, num_clients, n_adapters, api_port)
+
+
+@app.function(
+    image=image,
+    gpu="H200:2",
+    volumes=volumes,
+    timeout=6 * 60 * 60,
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+)
+def demo_math_rl(
+    max_wait: int = 1800,
+    n_adapters: int = 16,
+    api_port: int = 8000,
+    target_steps: int = 50,
+    n_samples: int = 8,
+    prompts_per_iter: int = 8,
+    max_new_tokens: int = 512,
+):
+    """Online-RL on real math datasets: 3 concurrent GRPO jobs (gsm8k, dapo-math,
+    deepscaler), each trained for ``target_steps`` steps on 2x H200.
+
+    Run ``provision_math`` once first to populate the base model + datasets.
+    """
+    _run_demo(
+        "rl",
+        max_wait,
+        3,
+        n_adapters,
+        api_port,
+        client_script_name="math_rl_clients.py",
+        extra_client_env={
+            "ENGINE_TARGET_STEPS": str(target_steps),
+            "ENGINE_N_SAMPLES": str(n_samples),
+            "ENGINE_PROMPTS_PER_ITER": str(prompts_per_iter),
+            "ENGINE_MAX_NEW_TOKENS": str(max_new_tokens),
+        },
+    )

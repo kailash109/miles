@@ -174,7 +174,8 @@ class TrainingCoordinator:
             token_budget=self.batching.max_train_tokens_per_step,
             max_adapters=self.batching.max_adapters_per_step,
         )
-        print(f"[coordinator] selected jobs: {selected}", flush=True)
+        if selected:
+            print(f"[coordinator] selected jobs: {selected}", flush=True)
 
         if not selected:
             return None
@@ -366,6 +367,15 @@ class TrainingCoordinator:
             if job.readiness == Readiness.EMPTY:
                 job.last_ready_at = None
             job.pending_publish_steps.add(job.optimizer_step)
+
+        # "Consecutive" means back-to-back steps without yielding to another job,
+        # so any job that didn't train this step resets. (The scheduler also
+        # ignores the cap when nothing else is waiting, so an uncontested job
+        # never wedges.)
+        selected_set = set(plan.selected_jobs)
+        for job in self.jobs.values():
+            if job.job_id not in selected_set:
+                job.consecutive_steps = 0
 
         self._apply_slot_state_after_success(plan)
 

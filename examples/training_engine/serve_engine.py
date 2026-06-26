@@ -114,9 +114,13 @@ async def _setup(args):
     return actor_model, coordinator, generator, rollout_manager, _legacy_controller
 
 
-# Serializes every update_weights() call (background loop + on-demand /sync_weights)
-# so two NCCL weight syncs never overlap on the train actors.
-_WEIGHT_SYNC_LOCK = threading.Lock()
+# Serializes weight syncs against each other AND against in-flight /sample
+# generations: the sync takes the write side (pausing + flushing sglang safely),
+# /sample takes the read side. Without this, a sync that pauses sglang while a
+# generation is in flight deadlocks on flush_cache.
+from miles.training_engine.api_server import ReadWriteLock
+
+_WEIGHT_SYNC_LOCK = ReadWriteLock()
 
 
 def _sync_adapters_to_sglang(actor_model, coordinator, loaded: set) -> None:
@@ -136,7 +140,7 @@ def _sync_adapters_to_sglang(actor_model, coordinator, loaded: set) -> None:
     hot = ray.get(coordinator.hot_adapters.remote())
     hot_by_name = {h["name"]: h for h in hot}
 
-    with _WEIGHT_SYNC_LOCK:
+    with _WEIGHT_SYNC_LOCK.write_lock():
         # Register/refresh resident adapters as ACTIVE at their coordinator slot.
         for h in hot:
             ray.get(controller.set_engine_adapter.remote(h["name"], h["rank"], h["alpha"], h["slot"]))
@@ -170,7 +174,7 @@ def _sync_one_job(actor_model, coordinator, rollout_manager, loaded: set, job_id
     info = ray.get(coordinator.hot_adapter.remote(job_id))
     if info is not None:
         controller = get_multi_lora_controller()
-        with _WEIGHT_SYNC_LOCK:
+        with _WEIGHT_SYNC_LOCK.write_lock():
             ray.get(controller.set_engine_adapter.remote(info["name"], info["rank"], info["alpha"], info["slot"]))
             asyncio.run(actor_model.update_weights())
             loaded.add(info["name"])
@@ -190,7 +194,7 @@ def _sync_one_job(actor_model, coordinator, rollout_manager, loaded: set, job_id
     asyncio.run(actor_model.wait_adapter_persisted(job_id))
     if not os.path.exists(os.path.join(path, "adapter_model.safetensors")):
         return None  # never persisted (e.g. never evicted while dirty)
-    with _WEIGHT_SYNC_LOCK:
+    with _WEIGHT_SYNC_LOCK.write_lock():
         ray.get(rollout_manager.load_lora_adapter_on_engines.remote(name, path))
         loaded.add(name)
     print(f"[engine] disk-loaded COLD adapter {name} (v{job.latest_published_version}) from {path}", flush=True)
@@ -268,7 +272,15 @@ def main() -> None:
         flush=True,
     )
     try:
-        serve(coordinator, generator, loaded_adapters, sync_weights_fn=sync_weights_fn, host=API_HOST, port=API_PORT)
+        serve(
+            coordinator,
+            generator,
+            loaded_adapters,
+            sync_weights_fn=sync_weights_fn,
+            weight_sync_lock=_WEIGHT_SYNC_LOCK,
+            host=API_HOST,
+            port=API_PORT,
+        )
     finally:
         stop.set()
 

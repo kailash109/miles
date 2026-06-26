@@ -1,9 +1,6 @@
-"""Demo clients for the training-engine HTTP API.
+"""Demo clients for the training-engine Tinker-style HTTP API.
 
-Waits for the engine to warm up, then opens a few independent clients that each
-register a LoRA job and submit a tiny SFT batch over HTTP (no Ray, no torch on
-the coordinator path). Each client prints "submitting job" then "received result"
-once the engine has trained its job at least one step.
+
 
 Env knobs:
     ENGINE_BASE_URL        engine HTTP base url            (default http://localhost:8000)
@@ -38,16 +35,15 @@ DEMO_MODE = os.environ.get("ENGINE_DEMO_MODE", "sft")
 RESULT_TIMEOUT = 300.0
 
 
+# starting both processes at the same time has to wait like 10 min for sglang + megatron + ray to initialize 
 def _wait_until_ready(max_wait: float) -> None:
-    """Poll /v1/stats until the engine is up (the API only serves once the
-    coordinator + workers + sglang are initialized). No fixed sleep."""
     deadline = time.time() + max_wait
     waited = 0
     while time.time() < deadline:
         try:
             r = requests.get(f"{BASE_URL}/v1/stats", timeout=5.0)
             if r.status_code == 200:
-                print(f"[client] engine ready after ~{waited}s: {r.json()}", flush=True)
+                print(f"[client] engine ready after {waited}s: {r.json()}", flush=True)
                 return
         except requests.RequestException:
             pass
@@ -55,9 +51,9 @@ def _wait_until_ready(max_wait: float) -> None:
         waited += 5
         if waited % 30 == 0:
             print(f"[client] still waiting for engine... ({waited}s)", flush=True)
-    print("[client] warning: engine not ready within max wait, proceeding anyway", flush=True)
+    print("[client] engine not ready within max wait, starting anyways ", flush=True)
 
-
+# example data for sft test 
 def _make_example(encode, eos_id, idx: int) -> dict:
     ex = build_sft_example(
         job_id="_demo",

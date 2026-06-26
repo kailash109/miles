@@ -53,13 +53,24 @@ class ContinuousTrainingScheduler:
         token_budget: int,
         max_adapters: int,
     ) -> list[SelectedJob]:
-        candidates = [j for j in jobs.values() if is_runnable(j)]
+        runnable = [j for j in jobs.values() if is_runnable(j)]
+        has_credit = [
+            j
+            for j in runnable
+            if j.deficit_tokens >= j.spec.scheduling.min_tokens_per_train_quantum
+        ]
         candidates = [
             j
-            for j in candidates
-            if j.deficit_tokens >= j.spec.scheduling.min_tokens_per_train_quantum
-            and j.consecutive_steps < j.spec.scheduling.max_consecutive_steps
+            for j in has_credit
+            if j.consecutive_steps < j.spec.scheduling.max_consecutive_steps
         ]
+        # The consecutive-steps cap is a fairness throttle that only makes sense
+        # while *other* jobs are waiting to run. If it would otherwise starve the
+        # engine -- e.g. the only job(s) with data have hit the cap and nothing
+        # preempts them (slots >= jobs, so no slot pressure) -- ignore it so an
+        # uncontested job keeps training instead of wedging forever.
+        if not candidates:
+            candidates = has_credit
 
         # Primary key: effective deficit after a cold-load penalty (so cold jobs
         # need more accrued credit to justify a load). Then prefer hot jobs, then
