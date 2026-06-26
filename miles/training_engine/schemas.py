@@ -1,8 +1,9 @@
-"""Typed contracts for the continuous-batched MultiLoRA training engine.
+"""Typed contracts for the continuous-batched MultiLoRA training engine (v2).
 
-These are intentionally torch/ray-free so the control plane (controller,
-scheduler, packer layout, validation) can be imported and unit-tested on a
-CPU-only machine without the GPU stack installed.
+Torch/ray-free so the coordinator, scheduler, batch store, and validation can be
+imported and unit-tested on a CPU-only machine. Job runtime state uses
+*orthogonal* fields (lifecycle / residency / readiness / execution) rather than
+one mixed enum.
 """
 
 from __future__ import annotations
@@ -14,32 +15,38 @@ from enum import Enum
 from typing import Any, Literal, Optional, Sequence
 
 
-class TrainingJobState(str, Enum):
-    QUEUED = "queued"
-    WAITING_FOR_DATA = "waiting_for_data"
-    TRAIN_READY = "train_ready"
-    LOADING = "loading"
-    HOT_IDLE = "hot_idle"
-    ACTIVE_STEP = "active_step"
-    PREEMPTING = "preempting"
-    COLD_READY = "cold_ready"
+# ---------------------------------------------------------------------------
+# Orthogonal job state
+# ---------------------------------------------------------------------------
+
+
+class Lifecycle(str, Enum):
+    RUNNING = "running"
+    COMPLETING = "completing"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
 
 
-TERMINAL_STATES = {
-    TrainingJobState.COMPLETED,
-    TrainingJobState.FAILED,
-    TrainingJobState.CANCELLED,
-}
+class Residency(str, Enum):
+    COLD = "cold"
+    LOADING = "loading"
+    HOT = "hot"
+    PREEMPTING = "preempting"
 
-# States in which a job is eligible to accrue scheduling credit / be selected.
-RUNNABLE_STATES = {
-    TrainingJobState.TRAIN_READY,
-    TrainingJobState.HOT_IDLE,
-    TrainingJobState.COLD_READY,
-}
+
+class Readiness(str, Enum):
+    EMPTY = "empty"
+    READY = "ready"
+    LEASED = "leased"
+
+
+class Execution(str, Enum):
+    IDLE = "idle"
+    ACTIVE_STEP = "active_step"
+
+
+TERMINAL_LIFECYCLES = {Lifecycle.COMPLETED, Lifecycle.FAILED, Lifecycle.CANCELLED}
 
 
 # ---------------------------------------------------------------------------
@@ -127,44 +134,94 @@ class TrainingJobSpec:
 
 
 # ---------------------------------------------------------------------------
-# Mutable per-job runtime state (engine-owned)
+# Engine policy
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BatchingPolicy:
+    max_train_tokens_per_step: int = 8192
+    max_adapters_per_step: int = 8
+    base_quantum_tokens: int = 2048
+    min_tokens_per_job: int = 512
+    max_batch_wait_s: float = 0.25
+    cost_metric: Literal["loss_tokens", "sequence_tokens"] = "loss_tokens"
+    idle_sleep_s: float = 0.01
+    step_timeout_s: float = 1800.0
+
+
+@dataclass(frozen=True)
+class QueueLimits:
+    max_jobs: int = 1024
+    max_ready_tokens_per_job: int = 2_000_000
+    max_ready_tokens_global: int = 50_000_000
+    max_batches_per_submit: int = 1024
+
+
+# ---------------------------------------------------------------------------
+# Mutable per-job runtime state (coordinator-owned)
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class TrainingJobRuntime:
     spec: TrainingJobSpec
-    state: TrainingJobState = TrainingJobState.QUEUED
 
-    # Physical hot slot; None when cold/not loaded.
+    lifecycle: Lifecycle = Lifecycle.RUNNING
+    residency: Residency = Residency.COLD
+    readiness: Readiness = Readiness.EMPTY
+    execution: Execution = Execution.IDLE
+
     slot: int | None = None
-    hot_since_engine_step: int | None = None
-
-    # Progress.
-    trained_steps: int = 0
-    trained_tokens: int = 0
-    current_adapter_version: int = 0
-    latest_adapter_uri: str | None = None
-
-    # Queue / accounting.
     ready_train_tokens: int = 0
-    ready_batch_ids: list[str] = field(default_factory=list)
+    leased_train_tokens: int = 0
+
     deficit_tokens: int = 0
     consecutive_steps: int = 0
+    hot_since_engine_step: int | None = None
 
-    # Checkpoint / offload.
+    trained_steps: int = 0
+    trained_tokens: int = 0
+
+    # Internal counter (advances on a committed step) vs the *public* version,
+    # which only advances once a durable artifact manifest is READY.
+    optimizer_step: int = 0
+    latest_materialized_step: int = 0
+    latest_published_version: int = 0
+    latest_adapter_uri: str | None = None
+    pending_publish_steps: set[int] = field(default_factory=set)
+
     cold_checkpoint_uri: str | None = None
-    dirty_since_publish: bool = False
-
-    # Error / reporting.
+    last_ready_at: float | None = None
     last_error: str | None = None
 
     @property
     def job_id(self) -> str:
         return self.spec.job_id
 
-    def is_runnable(self) -> bool:
-        return self.state in RUNNABLE_STATES and self.ready_train_tokens > 0
+
+def is_runnable(job: TrainingJobRuntime) -> bool:
+    return (
+        job.lifecycle == Lifecycle.RUNNING
+        and job.readiness == Readiness.READY
+        and job.execution == Execution.IDLE
+        and job.ready_train_tokens >= job.spec.scheduling.min_tokens_per_train_quantum
+    )
+
+
+def can_preempt(job: TrainingJobRuntime, engine_step: int) -> bool:
+    if job.lifecycle != Lifecycle.RUNNING:
+        return False
+    if job.residency != Residency.HOT or job.slot is None:
+        return False
+    if job.execution != Execution.IDLE:
+        return False
+    if not job.spec.scheduling.preemptible:
+        return False
+    if job.hot_since_engine_step is not None:
+        if engine_step - job.hot_since_engine_step < job.spec.scheduling.min_hot_steps:
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -179,36 +236,28 @@ class ExternalTrajectoryBatch:
     job_id: str
     adapter_version: int
 
-    # Compatibility fields; validated against hashes stored at job creation.
     base_model_hash: str | None = None
     tokenizer_hash: str | None = None
     lora_config_hash: str | None = None
 
-    # Shape [num_sequences, seq_len] (tensors) or ragged list[list[...]].
     input_ids: Any = None
     attention_mask: Any = None
     action_mask: Any = None
-
-    # Behavior-policy logprobs from external inference.
     old_logprobs: Any = None
 
-    # RL supervision (optional depending on advantage_source).
     rewards: Any | None = None
     advantages: Any | None = None
     returns: Any | None = None
     group_ids: list[str] | None = None
     ref_logprobs: Any | None = None
 
-    metadata: dict[str, Any] = field(default_factory=dict)
+    # Makes submissions idempotent across client retries.
+    client_batch_id: str | None = None
 
 
 @dataclass
 class TrainExample:
-    """Internal per-sequence training example.
-
-    Both the SFT dataset worker and external RL ingestion normalize to this so
-    the packer does not care about the data source.
-    """
+    """Internal per-sequence training example (SFT and RL normalize to this)."""
 
     job_id: str
     slot: int | None
@@ -219,10 +268,10 @@ class TrainExample:
     attention_mask: list[int]
     loss_mask: list[int]
 
-    # SFT.
+    # Next-token targets (-100 at ignored positions / sequence end). Used by SFT
+    # cross-entropy and by RL current-policy logprob gathering (§13.3).
     labels: list[int] | None = None
 
-    # RL.
     old_logprobs: list[float] | None = None
     rewards: list[float] | None = None
     advantages: list[float] | None = None
@@ -244,22 +293,20 @@ def make_batch_id(job_id: str) -> str:
     return f"{job_id}:{uuid.uuid4().hex[:12]}:{int(time.time() * 1000)}"
 
 
+def new_plan_id() -> str:
+    return f"plan_{uuid.uuid4().hex[:12]}"
+
+
 def lora_config_hash(adapter: AdapterSpec) -> str:
-    """Stable hash of the parts of a LoRA config that affect compatibility."""
     import hashlib
 
     payload = "|".join(
-        [
-            str(adapter.rank),
-            str(adapter.alpha),
-            ",".join(sorted(adapter.target_modules)),
-        ]
+        [str(adapter.rank), str(adapter.alpha), ",".join(sorted(adapter.target_modules))]
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def _shape(value: Any) -> tuple[int, ...]:
-    """Best-effort shape for tensors, numpy arrays, or nested python lists."""
     if value is None:
         return ()
     shape_attr = getattr(value, "shape", None)
@@ -276,7 +323,6 @@ def _shape(value: Any) -> tuple[int, ...]:
 
 
 def count_action_tokens(action_mask: Any) -> int:
-    """Sum of an action/loss mask given as tensor, array, or nested lists."""
     if action_mask is None:
         return 0
     sum_attr = getattr(action_mask, "sum", None)
@@ -284,10 +330,7 @@ def count_action_tokens(action_mask: Any) -> int:
         return int(sum_attr())
     total = 0
     for row in action_mask:
-        if isinstance(row, (list, tuple)):
-            total += int(sum(row))
-        else:
-            total += int(row)
+        total += int(sum(row)) if isinstance(row, (list, tuple)) else int(row)
     return total
 
 
@@ -296,35 +339,30 @@ class TrajectoryValidationError(ValueError):
 
 
 def validate_trajectory_batch(job: TrainingJobRuntime, batch: ExternalTrajectoryBatch) -> None:
-    """Enforce the disaggregated-RL ingestion contract (plan §5, §17)."""
+    """Enforce the disaggregated-RL ingestion contract against the *published* version."""
     spec = job.spec
 
     if batch.job_id != spec.job_id:
-        raise TrajectoryValidationError(
-            f"batch.job_id {batch.job_id!r} != job {spec.job_id!r}"
-        )
+        raise TrajectoryValidationError(f"batch.job_id {batch.job_id!r} != job {spec.job_id!r}")
 
-    # Policy-lag window. A batch cannot come from a future adapter version, and
-    # cannot be staler than max_policy_lag versions behind the current one.
-    if batch.adapter_version > job.current_adapter_version:
+    # Validate against the public/published version, not the internal step.
+    if batch.adapter_version > job.latest_published_version:
         raise TrajectoryValidationError(
-            f"future adapter_version {batch.adapter_version} > "
-            f"current {job.current_adapter_version}"
+            f"future or unpublished adapter_version {batch.adapter_version} > "
+            f"published {job.latest_published_version}"
         )
-    lag = job.current_adapter_version - batch.adapter_version
+    lag = job.latest_published_version - batch.adapter_version
     if lag > spec.budget.max_policy_lag:
         raise TrajectoryValidationError(
             f"policy lag {lag} exceeds max_policy_lag {spec.budget.max_policy_lag}"
         )
 
-    # Compatibility hashes (only checked when both sides provide them).
     expected_lora_hash = lora_config_hash(spec.adapter)
     if batch.lora_config_hash is not None and batch.lora_config_hash != expected_lora_hash:
         raise TrajectoryValidationError(
             f"lora_config_hash mismatch: {batch.lora_config_hash} != {expected_lora_hash}"
         )
 
-    # Shapes.
     ids_shape = _shape(batch.input_ids)
     attn_shape = _shape(batch.attention_mask)
     action_shape = _shape(batch.action_mask)
@@ -333,12 +371,10 @@ def validate_trajectory_batch(job: TrainingJobRuntime, batch: ExternalTrajectory
             f"input_ids/attention_mask/action_mask shapes differ: "
             f"{ids_shape} / {attn_shape} / {action_shape}"
         )
-    old_shape = _shape(batch.old_logprobs)
-    if old_shape != action_shape:
+    if _shape(batch.old_logprobs) != action_shape:
         raise TrajectoryValidationError(
-            f"old_logprobs shape {old_shape} != action_mask shape {action_shape}"
+            f"old_logprobs shape {_shape(batch.old_logprobs)} != action_mask {action_shape}"
         )
-
     if count_action_tokens(batch.action_mask) <= 0:
         raise TrajectoryValidationError("action_mask must select at least one token")
 
@@ -346,18 +382,13 @@ def validate_trajectory_batch(job: TrainingJobRuntime, batch: ExternalTrajectory
 def validate_sequence_lengths(example: TrainExample) -> None:
     n = len(example.input_ids)
     for name in ("attention_mask", "loss_mask"):
-        value = getattr(example, name)
-        if len(value) != n:
-            raise ValueError(
-                f"TrainExample.{name} length {len(value)} != input_ids length {n}"
-            )
-    if example.loss_type == "sft":
-        if example.labels is None or len(example.labels) != n:
-            raise ValueError("SFT TrainExample requires labels matching input_ids length")
-    else:
-        if example.old_logprobs is None or len(example.old_logprobs) != n:
-            raise ValueError("RL TrainExample requires old_logprobs matching input_ids length")
+        if len(getattr(example, name)) != n:
+            raise ValueError(f"TrainExample.{name} length != input_ids length {n}")
+    if example.labels is not None and len(example.labels) != n:
+        raise ValueError("TrainExample.labels length != input_ids length")
 
 
-def sum_loss_mask(examples: Sequence[TrainExample]) -> int:
-    return int(sum(int(sum(ex.loss_mask)) for ex in examples))
+@dataclass(frozen=True)
+class SelectedJob:
+    job_id: str
+    target_tokens: int

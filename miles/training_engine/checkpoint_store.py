@@ -16,36 +16,26 @@ import torch
 from megatron.bridge.peft.multi_lora_layers import expose_adapter_slot
 from megatron.core import mpu
 
-from .schemas import TrainingJobRuntime
-
 
 def _rank_tag() -> str:
     return f"tp{mpu.get_tensor_model_parallel_rank()}_pp{mpu.get_pipeline_model_parallel_rank()}"
 
 
 class CheckpointStore:
-    def write_training_checkpoint(
+    def write_training_checkpoint_to(
         self,
-        job: TrainingJobRuntime,
+        uri: str,
         adapter_state: dict[str, Any],
         optimizer_state: dict[str, Any],
     ) -> str:
-        version = job.current_adapter_version
-        uri = f"{job.spec.output_uri.rstrip('/')}/internal/checkpoints/v{version:06d}"
+        """Write this rank's adapter + optimizer shard to an explicit URI.
+
+        The coordinator supplies the URI in ``SlotPreemption.checkpoint_uri``, so
+        the worker doesn't need the job object.
+        """
         out_dir = Path(uri)
         out_dir.mkdir(parents=True, exist_ok=True)
-
-        payload = {
-            "job_id": job.spec.job_id,
-            "adapter_version": version,
-            "rank": job.spec.adapter.rank,
-            "alpha": job.spec.adapter.alpha,
-            "target_modules": list(job.spec.adapter.target_modules),
-            "adapter_megatron": adapter_state,
-            "optimizer": optimizer_state,
-            "trained_steps": job.trained_steps,
-            "trained_tokens": job.trained_tokens,
-        }
+        payload = {"adapter_megatron": adapter_state, "optimizer": optimizer_state}
         torch.save(payload, out_dir / f"checkpoint_{_rank_tag()}.pt")
         return uri
 

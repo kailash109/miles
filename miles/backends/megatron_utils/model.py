@@ -322,6 +322,60 @@ def forward_only(
     return rollout_data
 
 
+def train_with_custom_forward_step(
+    args: Namespace,
+    model: Sequence[DDP],
+    optimizer: MegatronOptimizer,
+    opt_param_scheduler: OptimizerParamScheduler,
+    *,
+    forward_step_func,
+    data_iterator,
+    num_microbatches: int,
+    seq_length: int,
+    micro_batch_size: int,
+) -> dict:
+    """Run one Miles/Megatron train step with a caller-provided ``forward_step_func``.
+
+    Reuses the normal Miles training-step lifecycle (grad scaling, grad
+    finalization across DP, optimizer step + overflow handling, scheduler step,
+    grad-buffer cleanup) so the continuous training engine does not re-derive any
+    of it. The caller's ``forward_step_func`` should only set the adapter token
+    counts, run the model forward, and return the continuous loss.
+    """
+    config = get_model_config(model[0])
+    config.grad_scale_func = optimizer.scale_loss
+    config.timers = None
+    config.finalize_model_grads_func = finalize_model_grads_with_empty_cache
+
+    for model_chunk in model:
+        model_chunk.zero_grad_buffer()
+    optimizer.zero_grad()
+
+    forward_backward_func = get_forward_backward_func()
+    forward_backward_func(
+        forward_step_func=forward_step_func,
+        data_iterator=data_iterator,
+        model=model,
+        num_microbatches=num_microbatches,
+        seq_length=seq_length,
+        micro_batch_size=micro_batch_size,
+        forward_only=False,
+    )
+
+    update_successful, grad_norm, _num_zeros = optimizer.step()
+    if update_successful:
+        opt_param_scheduler.step(increment=args.global_batch_size)
+
+    for model_chunk in model:
+        model_chunk.zero_grad_buffer()
+    optimizer.zero_grad()
+
+    return {
+        "update_successful": bool(update_successful),
+        "grad_norm": float(grad_norm) if grad_norm is not None else 0.0,
+    }
+
+
 def train_one_step(
     args: Namespace,
     rollout_id: int,

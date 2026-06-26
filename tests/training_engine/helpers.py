@@ -6,13 +6,16 @@ from miles.training_engine.schemas import (
     AdapterSpec,
     BudgetSpec,
     DatasetSpec,
+    Execution,
+    Lifecycle,
     LossSpec,
     OptimizerSpec,
+    Readiness,
+    Residency,
     SchedulingSpec,
     TrainExample,
     TrainingJobRuntime,
     TrainingJobSpec,
-    TrainingJobState,
 )
 
 
@@ -31,6 +34,8 @@ def make_spec(
     min_hot_steps: int = 0,
     max_policy_lag: int = 4,
     max_steps: int | None = None,
+    publish_every_steps: int = 1,
+    output_uri: str | None = None,
 ) -> TrainingJobSpec:
     return TrainingJobSpec(
         job_id=job_id,
@@ -45,6 +50,7 @@ def make_spec(
             tokens_per_update=tokens_per_update,
             max_policy_lag=max_policy_lag,
             max_steps=max_steps,
+            publish_every_steps=publish_every_steps,
         ),
         scheduling=SchedulingSpec(
             priority=priority,
@@ -53,7 +59,7 @@ def make_spec(
             max_consecutive_steps=max_consecutive_steps,
             min_tokens_per_train_quantum=min_tokens_per_train_quantum,
         ),
-        output_uri=f"/tmp/{job_id}",
+        output_uri=output_uri or f"/tmp/{job_id}",
     )
 
 
@@ -61,13 +67,19 @@ def make_runtime(
     job_id: str,
     *,
     ready_train_tokens: int = 0,
-    state: TrainingJobState = TrainingJobState.TRAIN_READY,
+    residency: Residency = Residency.COLD,
+    readiness: Readiness = Readiness.READY,
+    execution: Execution = Execution.IDLE,
+    lifecycle: Lifecycle = Lifecycle.RUNNING,
     slot: int | None = None,
     **spec_kwargs,
 ) -> TrainingJobRuntime:
     rt = TrainingJobRuntime(spec=make_spec(job_id, **spec_kwargs))
     rt.ready_train_tokens = ready_train_tokens
-    rt.state = state
+    rt.residency = residency
+    rt.readiness = readiness
+    rt.execution = execution
+    rt.lifecycle = lifecycle
     rt.slot = slot
     return rt
 

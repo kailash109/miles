@@ -123,14 +123,19 @@ class RayTrainGroup:
         """Broadcast weights from rank 0 to all other ranks."""
         await self._broadcast("update_weights")
 
-    async def run_continuous_sft_engine(self, engine_cfg: dict) -> dict:
-        """Run the in-actor continuous SFT engine on every rank (SPMD).
+    async def prepare_training_engine_workers(self, engine_cfg: dict) -> list:
+        """Initialize the plan executor on every worker."""
+        return await self._broadcast("prepare_training_engine_worker", engine_cfg)
 
-        Each rank runs an identical engine over identically-tokenized data, so
-        the Megatron collectives line up. Returns rank 0's job summary.
+    def execute_train_step_plan(self, plan_ref):
+        """Dispatch one TrainStepPlan to every worker; return result ObjectRefs.
+
+        Not awaited here so the driver can use ``ray.wait`` for timeout/health.
         """
-        results = await self._broadcast("run_continuous_sft_engine", engine_cfg)
-        return results[0] if results else {}
+        return [actor.execute_train_step_plan.remote(plan_ref) for actor in self._actor_handles]
+
+    async def training_engine_health(self) -> list:
+        return await self._broadcast("training_engine_health")
 
     async def load_pending_adapters(self) -> int:
         """Multi-LoRA: model-side install of PENDING adapters on every rank.

@@ -1,109 +1,93 @@
-"""Deficit-weighted fair scheduler for continuous MultiLoRA training.
+"""Deficit-weighted fair scheduler (pure: no torch, no ray, no model state).
 
-Pure-Python control-plane logic: no torch, no ray. Credit (deficit) accrues to
-runnable jobs and is spent in trained tokens, so a single job with a huge
-backlog cannot monopolize the engine.
+The coordinator owns a scheduler instance and calls ``accrue_deficits`` /
+``select_training_jobs`` / ``choose_preemption_victim``. Fairness is measured in
+*trained tokens*: credit accrues to runnable jobs and is spent when they train.
 """
 
 from __future__ import annotations
 
-from .schemas import TrainingJobRuntime, TrainingJobState
+from .schemas import (
+    Lifecycle,
+    Readiness,
+    Residency,
+    SelectedJob,
+    TrainingJobRuntime,
+    can_preempt,
+    is_runnable,
+)
+
+
+def _accrues_credit(job: TrainingJobRuntime) -> bool:
+    # Runnable, or waiting with ready data (so backlog jobs keep earning share).
+    return (
+        job.lifecycle == Lifecycle.RUNNING
+        and job.readiness == Readiness.READY
+        and job.ready_train_tokens > 0
+    )
 
 
 def accrue_deficits(jobs: dict[str, TrainingJobRuntime], base_quantum_tokens: int) -> None:
-    """Grant scheduling credit to runnable jobs, weighted by priority.
-
-    Module-level so it can run either on a live jobs dict (in-process) or, more
-    importantly, *inside the controller actor* (where mutating a returned
-    snapshot wouldn't persist because Ray hands back deserialized copies).
-    """
     for job in jobs.values():
-        if (
-            job.state
-            in {
-                TrainingJobState.TRAIN_READY,
-                TrainingJobState.HOT_IDLE,
-                TrainingJobState.COLD_READY,
-            }
-            and job.ready_train_tokens > 0
-        ):
+        if _accrues_credit(job):
             job.deficit_tokens += base_quantum_tokens * job.spec.scheduling.priority
 
 
 class ContinuousTrainingScheduler:
-    def __init__(
-        self,
-        *,
-        train_tokens_per_step: int,
-        max_adapters_per_step: int,
-        base_quantum_tokens: int,
-    ):
-        if train_tokens_per_step <= 0:
-            raise ValueError("train_tokens_per_step must be positive")
-        if max_adapters_per_step <= 0:
-            raise ValueError("max_adapters_per_step must be positive")
+    def __init__(self, *, base_quantum_tokens: int):
         if base_quantum_tokens <= 0:
             raise ValueError("base_quantum_tokens must be positive")
-        self.train_tokens_per_step = train_tokens_per_step
-        self.max_adapters_per_step = max_adapters_per_step
         self.base_quantum_tokens = base_quantum_tokens
 
     def accrue_deficits(self, jobs: dict[str, TrainingJobRuntime]) -> None:
-        """Grant scheduling credit to runnable jobs, weighted by priority."""
         accrue_deficits(jobs, self.base_quantum_tokens)
+
+    def _cold_load_penalty(self, job: TrainingJobRuntime) -> int:
+        # Discourage loading a cold job for a tiny one-step quantum.
+        return 0 if job.residency == Residency.HOT else self.base_quantum_tokens
 
     def select_training_jobs(
         self,
         jobs: dict[str, TrainingJobRuntime],
-    ) -> list[tuple[str, int]]:
-        """Return [(job_id, target_tokens)] to train in the next quantum."""
-        candidates: list[TrainingJobRuntime] = []
-        for job in jobs.values():
-            if job.state in {
-                TrainingJobState.FAILED,
-                TrainingJobState.CANCELLED,
-                TrainingJobState.COMPLETED,
-            }:
-                continue
-            if job.state == TrainingJobState.ACTIVE_STEP:
-                continue
-            min_quantum = job.spec.scheduling.min_tokens_per_train_quantum
-            if job.ready_train_tokens < min_quantum:
-                continue
-            if job.deficit_tokens < min_quantum:
-                continue
-            candidates.append(job)
+        *,
+        token_budget: int,
+        max_adapters: int,
+    ) -> list[SelectedJob]:
+        candidates = [j for j in jobs.values() if is_runnable(j)]
+        candidates = [
+            j
+            for j in candidates
+            if j.deficit_tokens >= j.spec.scheduling.min_tokens_per_train_quantum
+            and j.consecutive_steps < j.spec.scheduling.max_consecutive_steps
+        ]
 
-        # Highest deficit first; prefer already-hot jobs when fairness is close;
-        # then jobs that have run fewer consecutive steps; then higher priority.
+        # Primary key: effective deficit after a cold-load penalty (so cold jobs
+        # need more accrued credit to justify a load). Then prefer hot jobs, then
+        # least-recently-run, then higher priority.
         candidates.sort(
             key=lambda j: (
-                -j.deficit_tokens,
-                0 if j.slot is not None else 1,
+                -(j.deficit_tokens - self._cold_load_penalty(j)),
+                0 if j.residency == Residency.HOT else 1,
                 j.consecutive_steps,
                 -j.spec.scheduling.priority,
             )
         )
 
-        selected: list[tuple[str, int]] = []
-        remaining = self.train_tokens_per_step
+        selected: list[SelectedJob] = []
+        remaining = token_budget
         for job in candidates:
-            if len(selected) >= self.max_adapters_per_step:
+            if len(selected) >= max_adapters or remaining <= 0:
                 break
-            if remaining <= 0:
-                break
-            if job.consecutive_steps >= job.spec.scheduling.max_consecutive_steps:
-                continue
-            want = min(
+            target = min(
                 remaining,
                 job.spec.budget.tokens_per_update,
                 job.ready_train_tokens,
                 job.deficit_tokens,
             )
-            if want < job.spec.scheduling.min_tokens_per_train_quantum:
+            if target < job.spec.scheduling.min_tokens_per_train_quantum:
                 continue
-            selected.append((job.spec.job_id, int(want)))
-            remaining -= int(want)
+            selected.append(SelectedJob(job_id=job.spec.job_id, target_tokens=int(target)))
+            remaining -= int(target)
         return selected
 
     def choose_preemption_victim(
@@ -112,32 +96,19 @@ class ContinuousTrainingScheduler:
         incoming_job: TrainingJobRuntime,
         engine_step: int,
     ) -> TrainingJobRuntime | None:
-        """Pick a hot job to evict so ``incoming_job`` can load, or None."""
-        candidates: list[TrainingJobRuntime] = []
-        for job in hot_jobs:
-            if job.spec.job_id == incoming_job.spec.job_id:
-                continue
-            if not job.spec.scheduling.preemptible:
-                continue
-            if job.state == TrainingJobState.ACTIVE_STEP:
-                continue
-            if job.hot_since_engine_step is not None:
-                hot_steps = engine_step - job.hot_since_engine_step
-                if hot_steps < job.spec.scheduling.min_hot_steps:
-                    continue
-            candidates.append(job)
-
+        candidates = [
+            j
+            for j in hot_jobs
+            if j.spec.job_id != incoming_job.spec.job_id and can_preempt(j, engine_step)
+        ]
         if not candidates:
             return None
-
-        # Prefer evicting idle (no ready data) jobs, then under-credited jobs,
-        # then jobs that have hogged the slot the longest, then lower priority.
         candidates.sort(
             key=lambda j: (
-                j.ready_train_tokens > 0,
-                j.deficit_tokens,
-                -j.consecutive_steps,
-                j.spec.scheduling.priority,
+                j.ready_train_tokens > 0,  # idle (no data) first
+                j.deficit_tokens,  # least under-served first
+                -j.consecutive_steps,  # longest hogger first
+                j.spec.scheduling.priority,  # lowest priority first
             )
         )
         return candidates[0]

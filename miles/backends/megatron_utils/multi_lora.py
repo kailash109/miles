@@ -198,11 +198,16 @@ def iter_named_multi_lora_modules(model):
 
 
 def iter_adapter_named_params_for_slot(model, idx: int):
-    """Yield ``(stable_name, param)`` for adapter slot ``idx``."""
+    """Yield ``(stable_name, param)`` for adapter slot ``idx``.
+
+    The name is deliberately *slot-independent* (``...adapter.<param>``, not
+    ``...adapters.<idx>.<param>``) so optimizer state captured from one slot can
+    be restored into a different slot when a logical job migrates.
+    """
     for module_prefix, module in iter_named_multi_lora_modules(model):
         adapter = module.adapters[idx]
         for name, param in adapter.named_parameters():
-            yield f"{module_prefix}.adapters.{idx}.{name}", param
+            yield f"{module_prefix}.adapter.{name}", param
 
 
 def capture_optimizer_state_for_adapter(optimizer, model, idx: int) -> dict:
