@@ -205,22 +205,33 @@ class LoraTrainingClient:
         if len(rollouts) != len(rewards):
             raise ValueError(f"rollouts ({len(rollouts)}) and rewards ({len(rewards)}) length mismatch")
 
+        # GRPO group-relative advantages from the per-rollout scalar rewards. The
+        # default loss uses advantage_source="provided", so we must send per-token
+        # `advantages` (not just rewards). Normalize across this submitted group.
+        rewards_f = [float(r) for r in rewards]
+        n = len(rewards_f)
+        mean_r = sum(rewards_f) / n
+        std_r = (sum((r - mean_r) ** 2 for r in rewards_f) / n) ** 0.5
+        adv_scalars = [(r - mean_r) / (std_r + 1e-6) for r in rewards_f]
+
         input_ids: list[list[int]] = []
         attention_mask: list[list[int]] = []
         action_mask: list[list[int]] = []
         old_logprobs: list[list[float]] = []
         per_token_rewards: list[list[float]] = []
-        for rollout, reward in zip(rollouts, rewards, strict=True):
+        per_token_advantages: list[list[float]] = []
+        for rollout, reward, adv in zip(rollouts, rewards_f, adv_scalars, strict=True):
             prompt_ids = rollout["prompt_ids"]
             response_ids = rollout["response_ids"]
             seq = list(prompt_ids) + list(response_ids)
-            n_resp = len(response_ids)
+            n_prompt, n_resp = len(prompt_ids), len(response_ids)
             input_ids.append(seq)
             attention_mask.append([1] * len(seq))
-            action_mask.append([0] * len(prompt_ids) + [1] * n_resp)
+            action_mask.append([0] * n_prompt + [1] * n_resp)
             # old_logprobs aligned to the full sequence (0 on prompt positions).
-            old_logprobs.append([0.0] * len(prompt_ids) + list(rollout["response_logprobs"]))
-            per_token_rewards.append([0.0] * len(prompt_ids) + [float(reward)] * n_resp)
+            old_logprobs.append([0.0] * n_prompt + list(rollout["response_logprobs"]))
+            per_token_rewards.append([0.0] * n_prompt + [reward] * n_resp)
+            per_token_advantages.append([0.0] * n_prompt + [adv] * n_resp)
 
         batch = {
             "adapter_version": adapter_version,
@@ -229,6 +240,7 @@ class LoraTrainingClient:
             "action_mask": action_mask,
             "old_logprobs": old_logprobs,
             "rewards": per_token_rewards,
+            "advantages": per_token_advantages,
             "client_batch_id": client_batch_id,
         }
         return self.submit_trajectory_batch(batch)

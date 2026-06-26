@@ -135,7 +135,7 @@ def provision():
     print("Provisioned Qwen3-4B + gsm8k into the assets volume.")
 
 
-def _run_demo(mode: str, wait_seconds: int, num_clients: int, n_adapters: int, api_port: int):
+def _run_demo(mode: str, max_wait: int, num_clients: int, n_adapters: int, api_port: int):
     """Serve the engine and run a few demo clients against it."""
     assets_volume.reload()
     hf_cache_volume.reload()
@@ -165,13 +165,13 @@ def _run_demo(mode: str, wait_seconds: int, num_clients: int, n_adapters: int, a
     client_env = {
         **os.environ,
         "ENGINE_BASE_URL": f"http://localhost:{api_port}",
-        "ENGINE_CLIENT_WAIT": str(wait_seconds),
+        "ENGINE_CLIENT_MAX_WAIT": str(max_wait),
         "ENGINE_NUM_CLIENTS": str(num_clients),
         "ENGINE_BASE_MODEL": "/root/Qwen3-4B/",
         "ENGINE_DEMO_MODE": mode,
     }
     try:
-        print(f"Client runner will wait {wait_seconds}s, then open {num_clients} clients.", flush=True)
+        print(f"Client runner: polling until ready (max {max_wait}s), then {num_clients} clients.", flush=True)
         subprocess.run(["python3", str(client_script)], cwd=MILES_ROOT, env=client_env, check=True)
     finally:
         print("Demo clients finished; stopping engine server.", flush=True)
@@ -189,9 +189,9 @@ def _run_demo(mode: str, wait_seconds: int, num_clients: int, n_adapters: int, a
     timeout=6 * 60 * 60,
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
-def demo(wait_seconds: int = 300, num_clients: int = 3, n_adapters: int = 16, api_port: int = 8000):
+def demo(max_wait: int = 1800, num_clients: int = 3, n_adapters: int = 16, api_port: int = 8000):
     """SFT demo on a single H200 (train-only, no sglang)."""
-    _run_demo("sft", wait_seconds, num_clients, n_adapters, api_port)
+    _run_demo("sft", max_wait, num_clients, n_adapters, api_port)
 
 
 @app.function(
@@ -201,6 +201,6 @@ def demo(wait_seconds: int = 300, num_clients: int = 3, n_adapters: int = 16, ap
     timeout=6 * 60 * 60,
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
-def demo_rl(wait_seconds: int = 360, num_clients: int = 3, n_adapters: int = 16, api_port: int = 8000):
+def demo_rl(max_wait: int = 1800, num_clients: int = 3, n_adapters: int = 16, api_port: int = 8000):
     """Online-RL demo on 2x H200 (disaggregated: 1 trainer GPU + 1 sglang GPU)."""
-    _run_demo("rl", wait_seconds, num_clients, n_adapters, api_port)
+    _run_demo("rl", max_wait, num_clients, n_adapters, api_port)

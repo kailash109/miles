@@ -6,11 +6,11 @@ the coordinator path). Each client prints "submitting job" then "received result
 once the engine has trained its job at least one step.
 
 Env knobs:
-    ENGINE_BASE_URL     engine HTTP base url       (default http://localhost:8000)
-    ENGINE_CLIENT_WAIT  seconds to wait first      (default 300)
-    ENGINE_NUM_CLIENTS  how many clients to open   (default 3)
-    ENGINE_BASE_MODEL   base model path            (default /root/Qwen3-4B/)
-    ENGINE_DEMO_MODE    "sft" or "rl"              (default sft)
+    ENGINE_BASE_URL        engine HTTP base url            (default http://localhost:8000)
+    ENGINE_CLIENT_MAX_WAIT max seconds to poll for ready    (default 1800)
+    ENGINE_NUM_CLIENTS     how many clients to open         (default 3)
+    ENGINE_BASE_MODEL      base model path                  (default /root/Qwen3-4B/)
+    ENGINE_DEMO_MODE       "sft" or "rl"                    (default sft)
 
 In "rl" mode the client exercises the online-RL loop: sample rollouts from the
 engine, score them client-side (a trivial demo reward), then submit the scored
@@ -31,25 +31,31 @@ from miles.training_engine.dataset_worker import build_sft_example
 from miles.training_engine.schemas import DatasetSpec
 
 BASE_URL = os.environ.get("ENGINE_BASE_URL", "http://localhost:8000")
-WAIT_SECONDS = int(os.environ.get("ENGINE_CLIENT_WAIT", "300"))
+MAX_WAIT = int(os.environ.get("ENGINE_CLIENT_MAX_WAIT", "1800"))
 NUM_CLIENTS = int(os.environ.get("ENGINE_NUM_CLIENTS", "3"))
 BASE_MODEL = os.environ.get("ENGINE_BASE_MODEL", "/root/Qwen3-4B/")
 DEMO_MODE = os.environ.get("ENGINE_DEMO_MODE", "sft")
 RESULT_TIMEOUT = 300.0
 
 
-def _wait_until_ready(deadline: float) -> None:
-    """Poll /v1/stats until the engine answers (or the deadline passes)."""
+def _wait_until_ready(max_wait: float) -> None:
+    """Poll /v1/stats until the engine is up (the API only serves once the
+    coordinator + workers + sglang are initialized). No fixed sleep."""
+    deadline = time.time() + max_wait
+    waited = 0
     while time.time() < deadline:
         try:
             r = requests.get(f"{BASE_URL}/v1/stats", timeout=5.0)
             if r.status_code == 200:
-                print(f"[client] engine reachable: {r.json()}", flush=True)
+                print(f"[client] engine ready after ~{waited}s: {r.json()}", flush=True)
                 return
         except requests.RequestException:
             pass
         time.sleep(5.0)
-    print("[client] warning: engine not confirmed ready, proceeding anyway", flush=True)
+        waited += 5
+        if waited % 30 == 0:
+            print(f"[client] still waiting for engine... ({waited}s)", flush=True)
+    print("[client] warning: engine not ready within max wait, proceeding anyway", flush=True)
 
 
 def _make_example(encode, eos_id, idx: int) -> dict:
@@ -121,6 +127,13 @@ def _run_rl_client(idx: int, encode, eos_id) -> None:
     )
     rollouts = sampled["rollouts"]
     rewards = [_demo_reward(r.get("text", ""), idx) for r in rollouts]
+
+    # Print the sampled rollouts so generation can be eyeballed for correctness.
+    print(f"[client {idx}] prompt={f'Q: what is {idx} + {idx}? A:'!r} adapter_version={sampled['adapter_version']}", flush=True)
+    for i, (r, rew) in enumerate(zip(rollouts, rewards)):
+        n_tok = len(r.get("response_ids", []))
+        text = (r.get("text", "") or "").replace("\n", " ")[:160]
+        print(f"[client {idx}]   rollout {i}: reward={rew} tokens={n_tok} text={text!r}", flush=True)
     print(f"[client {idx}] scored {len(rollouts)} rollouts, mean_reward={sum(rewards) / max(1, len(rewards)):.2f}", flush=True)
 
     tc.submit_scored_rollouts(rollouts, rewards, adapter_version=sampled["adapter_version"])
@@ -135,9 +148,8 @@ def _run_client(idx: int, encode, eos_id) -> None:
 
 
 def main() -> None:
-    print(f"[client] waiting {WAIT_SECONDS}s for the engine to come up ...", flush=True)
-    time.sleep(WAIT_SECONDS)
-    _wait_until_ready(time.time() + 120.0)
+    print(f"[client] polling {BASE_URL} until the engine is ready (max {MAX_WAIT}s) ...", flush=True)
+    _wait_until_ready(MAX_WAIT)
 
     from transformers import AutoTokenizer
 
