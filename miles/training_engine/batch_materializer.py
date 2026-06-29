@@ -70,14 +70,40 @@ class BatchMaterializer:
             for payload in payloads:
                 examples.extend(self._payload_to_examples(payload, job_id, slot, plan.loss_type))
 
+        if not examples:
+            return []
+
+        # Data-parallel sharding: each DP rank trains a *disjoint* subset of the
+        # plan's sequences. Megatron's finalize_model_grads sums grads across the
+        # DP(-CP) group and (with per-token loss) sums the token normalizer too,
+        # so this reproduces single-GPU semantics over the full global batch
+        # while giving DP-x throughput. TP/CP ranks share a DP coordinate, so
+        # they get the *same* shard (required for collective-correct TP forward).
+        #
+        # A rank may legitimately get an EMPTY shard (fewer sequences than DP
+        # ranks). That is fine: the executor still drives the end-of-step DP
+        # collectives (grad finalize + optimizer step) for an empty shard so all
+        # ranks stay in lockstep -- without wasting a forward/backward.
+        dp_rank, dp_size = self._dp_rank_and_size()
+        local = examples[dp_rank::dp_size] if dp_size > 1 else examples
+
         # One sequence per microbatch (normal causal attention); grads accumulate
         # across microbatches into disjoint per-slot params in one optimizer step.
         return [
             pack_examples_by_slot(
                 [ex], max_slots=self.args.multi_lora_n_adapters, pad_to_multiple=1, loss_type=plan.loss_type
             )
-            for ex in examples
+            for ex in local
         ]
+
+    def _dp_rank_and_size(self) -> tuple[int, int]:
+        try:
+            from miles.backends.training_utils.parallel import get_parallel_state
+
+            dp = get_parallel_state().intra_dp
+            return dp.rank, dp.size
+        except Exception:
+            return 0, 1
 
     def _payload_to_examples(self, payload, job_id, slot, loss_type) -> list[TrainExample]:
         if isinstance(payload, list):  # pre-tokenized SFT TrainExamples

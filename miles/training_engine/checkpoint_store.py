@@ -18,7 +18,14 @@ from megatron.core import mpu
 
 
 def _rank_tag() -> str:
-    return f"tp{mpu.get_tensor_model_parallel_rank()}_pp{mpu.get_pipeline_model_parallel_rank()}"
+    # Include the data-parallel rank: with the distributed optimizer (always on),
+    # optimizer state is sharded across DP, so each DP rank owns a distinct shard
+    # and must write to a distinct file. Without the dp tag, DP>1 ranks would
+    # clobber each other's preemption checkpoints at the same path.
+    dp_rank = mpu.get_data_parallel_rank()
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    pp_rank = mpu.get_pipeline_model_parallel_rank()
+    return f"tp{tp_rank}_pp{pp_rank}_dp{dp_rank}"
 
 
 class CheckpointStore:

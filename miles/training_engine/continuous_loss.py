@@ -62,11 +62,12 @@ def _tp_all_reduce_sum(value):
 def continuous_sft_loss(logits, batch: dict, job_specs: dict[str, Any]):
     """Token-level cross-entropy.
 
-    Returns ``(sum_loss, num_tokens, metrics)`` -- the *unnormalized* summed
+    Returns ``(sum_loss, num_tokens, per_job)`` -- the *unnormalized* summed
     token loss and the loss-token count -- matching Miles' loss contract so the
     caller can emit the Megatron ``(loss, normalizer, log)`` tuple and let
-    ``finalize_model_grads`` do per-token gradient normalization. Per-job entries
-    are reported in ``metrics`` for logging only.
+    ``finalize_model_grads`` do per-token gradient normalization. ``per_job`` maps
+    ``job_id -> {"loss_sum", "loss_tokens"}`` (TP-reduced raw sums, detached) so
+    the caller can aggregate per-adapter means across microbatches/DP for logging.
     """
     labels = batch["labels"].to(logits.device)
     loss_masks = batch["loss_masks"].to(logits.device)
@@ -81,19 +82,26 @@ def continuous_sft_loss(logits, batch: dict, job_specs: dict[str, Any]):
     )
     masked = token_losses * loss_masks
 
-    metrics: dict[str, Any] = {}
-    for job_id, ranges in batch["job_ranges"].items():
-        js = torch.zeros((), device=logits.device)
-        jc = torch.zeros((), device=logits.device)
-        for start, end in ranges:
-            js = js + masked[start:end].sum()
-            jc = jc + loss_masks[start:end].sum()
-        metrics[f"{job_id}/loss"] = (js / jc.clamp_min(1.0)).detach()
-        metrics[f"{job_id}/tokens"] = jc.detach()
+    # Per-job detached raw sums for logging (loss_sum, loss_tokens, n_seq). Per-rank
+    # (not TP-reduced): the caller DP-reduces across data-parallel ranks. Computed
+    # under no_grad so this logging branch never feeds autograd.
+    per_job: dict[str, dict[str, torch.Tensor]] = {}
+    with torch.no_grad():
+        for job_id, ranges in batch["job_ranges"].items():
+            ls = torch.zeros((), device=logits.device)
+            lt = torch.zeros((), device=logits.device)
+            for start, end in ranges:
+                ls += masked[start:end].sum()
+                lt += loss_masks[start:end].sum()
+            per_job[job_id] = {
+                "loss_sum": ls,
+                "loss_tokens": lt,
+                "n_seq": torch.tensor(float(len(ranges)), device=logits.device),
+            }
 
     sum_loss = _tp_all_reduce_sum(masked.sum())
     num_tokens = _tp_all_reduce_sum(loss_masks.sum())
-    return sum_loss, num_tokens, metrics
+    return sum_loss, num_tokens, per_job
 
 
 def _advantages_for_range(batch: dict, job_id: str, start: int, end: int, spec):
@@ -116,20 +124,28 @@ def _advantages_for_range(batch: dict, job_id: str, start: int, end: int, spec):
 def continuous_rl_loss(model_logprobs, batch: dict, job_specs: dict[str, Any]):
     """Clipped policy-gradient (GRPO/PPO) from external behavior logprobs.
 
-    Returns ``(sum_loss, num_tokens, metrics)`` over action tokens, same
-    contract as :func:`continuous_sft_loss`.
+    Returns ``(sum_loss, num_tokens, per_job)`` over action tokens, same
+    contract as :func:`continuous_sft_loss`. ``per_job`` additionally carries a
+    ``reward_sum`` (sum of per-token rewards, falling back to advantages when the
+    batch has no raw rewards) so the caller can log per-adapter mean reward.
     """
     device = model_logprobs.device
     old_logprobs = batch["rollout_log_probs"].to(device)
     action_mask = batch["loss_masks"].to(device)
+    raw_rewards = batch.get("rewards")
     total_sum = torch.zeros((), device=device)
     total_tokens = torch.zeros((), device=device)
-    metrics: dict[str, Any] = {}
+
+    # Per-job detached raw sums for logging (loss_sum, loss_tokens, reward_sum,
+    # n_seq), kept separate from the grad-carrying total loss. Per-rank (not
+    # TP-reduced); the caller DP-reduces across data-parallel ranks.
+    per_job: dict[str, dict[str, torch.Tensor]] = {}
 
     for job_id, ranges in batch["job_ranges"].items():
         spec = job_specs[job_id]  # a LossSpec
-        job_sum = torch.zeros((), device=device)
-        job_count = torch.zeros((), device=device)
+        job_loss = torch.zeros((), device=device)
+        job_tokens = torch.zeros((), device=device)
+        job_reward = torch.zeros((), device=device)
         for start, end in ranges:
             pi_logp = model_logprobs[start:end]
             old_logp = old_logprobs[start:end]
@@ -149,13 +165,25 @@ def continuous_rl_loss(model_logprobs, batch: dict, job_specs: dict[str, Any]):
             else:
                 token_loss = policy_loss
 
-            job_sum = job_sum + (token_loss * mask).sum()
-            job_count = job_count + mask.sum()
+            masked_loss = (token_loss * mask).sum()
+            masked_tokens = mask.sum()
+            total_sum = total_sum + masked_loss
+            total_tokens = total_tokens + masked_tokens
 
-        metrics[f"{job_id}/loss"] = (job_sum / job_count.clamp_min(1.0)).detach()
-        total_sum = total_sum + job_sum
-        total_tokens = total_tokens + job_count
+            job_loss = job_loss + masked_loss
+            job_tokens = job_tokens + masked_tokens
+            # Prefer the raw reward signal; fall back to advantages when the
+            # batch only carries advantages (advantage_source="provided").
+            reward_slice = raw_rewards[start:end].to(device) if raw_rewards is not None else advantages
+            job_reward = job_reward + (reward_slice * mask).sum()
+
+        per_job[job_id] = {
+            "loss_sum": job_loss.detach(),
+            "loss_tokens": job_tokens.detach(),
+            "reward_sum": job_reward.detach(),
+            "n_seq": torch.tensor(float(len(ranges)), device=device),
+        }
 
     total_sum = _tp_all_reduce_sum(total_sum)
     total_tokens = _tp_all_reduce_sum(total_tokens)
-    return total_sum, total_tokens, metrics
+    return total_sum, total_tokens, per_job

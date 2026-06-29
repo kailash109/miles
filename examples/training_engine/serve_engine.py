@@ -30,6 +30,7 @@ from miles.ray.placement_group import allocate_train_group, create_placement_gro
 from miles.training_engine.coordinator import make_training_coordinator
 from miles.training_engine.results import WorkerStepResult
 from miles.training_engine.schemas import BatchingPolicy, QueueLimits
+from miles.utils import tracking_utils
 from miles.utils.arguments import parse_args
 from miles.utils.logging_utils import configure_logger
 
@@ -37,6 +38,10 @@ API_HOST = os.environ.get("ENGINE_API_HOST", "0.0.0.0")
 API_PORT = int(os.environ.get("ENGINE_API_PORT", "8000"))
 ENABLE_GENERATION = os.environ.get("ENGINE_ENABLE_GENERATION", "0") == "1"
 SYNC_EVERY = max(1, int(os.environ.get("ENGINE_SYNC_EVERY", "1")))
+# How long the coordinator waits for more jobs/tokens to accumulate before
+# dispatching a step, so multiple adapters co-pack into one step instead of
+# training one job at a time. Higher = wider batches, more per-step latency.
+MAX_BATCH_WAIT_S = float(os.environ.get("ENGINE_MAX_BATCH_WAIT_S", "2.0"))
 # Persistent HF-PEFT adapter store (disk-load into sglang for paged-out jobs).
 ADAPTER_STORE = os.environ.get("ENGINE_ADAPTER_STORE") or None
 
@@ -104,12 +109,36 @@ async def _setup(args):
     n_slots = args.multi_lora_n_adapters
     if ADAPTER_STORE:
         os.makedirs(ADAPTER_STORE, exist_ok=True)
+    # Per-step training token budget. The greedy scheduler packs jobs until this
+    # is exhausted, so it (not slot count) caps how many runnable adapters batch
+    # into one step. The budget is sharded across the data-parallel trainers, so
+    # the default scales with BOTH slots and DP size -- keeping the per-GPU load
+    # constant as trainers are added, so more trainers => more adapters/step
+    # rather than the same count spread thinner. Override with
+    # ENGINE_MAX_TRAIN_TOKENS_PER_STEP.
+    tp = max(1, int(getattr(args, "tensor_model_parallel_size", 1) or 1))
+    pp = max(1, int(getattr(args, "pipeline_model_parallel_size", 1) or 1))
+    cp = max(1, int(getattr(args, "context_parallel_size", 1) or 1))
+    world = max(1, int(args.actor_num_nodes) * int(args.actor_num_gpus_per_node))
+    dp_size = max(1, world // (tp * pp * cp))
+    _max_tokens_env = os.environ.get("ENGINE_MAX_TRAIN_TOKENS_PER_STEP", "")
+    max_train_tokens_per_step = int(_max_tokens_env) if _max_tokens_env else n_slots * 2048 * dp_size
     coordinator = make_training_coordinator(
         base_model=args.hf_checkpoint,
         max_hot_slots=n_slots,
-        batching=BatchingPolicy(max_adapters_per_step=n_slots),
+        batching=BatchingPolicy(
+            max_adapters_per_step=n_slots,
+            max_batch_wait_s=MAX_BATCH_WAIT_S,
+            max_train_tokens_per_step=max_train_tokens_per_step,
+        ),
         limits=QueueLimits(),
         adapter_store=ADAPTER_STORE,
+    )
+    print(
+        f"[engine] batching: slots={n_slots} dp_size={dp_size} "
+        f"max_train_tokens_per_step={max_train_tokens_per_step} "
+        f"max_batch_wait_s={MAX_BATCH_WAIT_S}",
+        flush=True,
     )
     return actor_model, coordinator, generator, rollout_manager, _legacy_controller
 
@@ -201,8 +230,80 @@ def _sync_one_job(actor_model, coordinator, rollout_manager, loaded: set, job_id
     return int(job.latest_published_version)
 
 
+def _init_engine_wandb(args) -> None:
+    """Init the driver-side W&B run and bind per-adapter metrics to ``engine/step``.
+
+    The engine has a single metric writer (this driver loop), so each adapter's
+    curves live under their own ``{job_id}/...`` section in W&B, all on a shared
+    engine-step x-axis. Per-job binding happens lazily as jobs first appear.
+    """
+    tracking_utils.init_tracking(args, primary=True)
+    if args.use_wandb:
+        import wandb
+
+        wandb.define_metric("engine/step")
+        wandb.define_metric("train/*", step_metric="engine/step")
+
+
+_SAMPLE_COLUMNS = ["engine_step", "adapter", "reward", "response_len", "prompt", "response"]
+_MAX_SAMPLE_ROWS = int(os.environ.get("ENGINE_LOG_SAMPLES_MAX_ROWS", "200"))
+
+
+def _log_step_metrics(args, plan, results, defined_jobs: set, sample_rows: list) -> None:
+    """Forward this step's aggregate + per-adapter metrics to W&B/tracking.
+
+    Per-adapter loss/reward/tokens/response-length arrive in
+    ``WorkerStepResult.metrics`` keyed ``{job_id}/train/*`` (DP-reduced on the
+    last pipeline stage); the aggregate ``loss``/``grad_norm`` are remapped under
+    the ``train/`` section. Decoded sample rollouts (rank 0, env-gated) ride in
+    ``_rollout_samples`` and are rendered as a rolling ``rollouts/samples`` table.
+    """
+    merged: dict = {}
+    for r in results:
+        if r.ok and r.metrics:
+            merged.update(r.metrics)
+    if not merged:
+        return
+
+    samples = merged.pop("_rollout_samples", None)
+
+    log_dict: dict = {}
+    for key, val in merged.items():
+        if key in ("update_successful", "skipped"):
+            continue
+        if key == "loss":
+            log_dict["train/loss"] = val
+        elif key == "grad_norm":
+            log_dict["train/grad_norm"] = val
+        else:
+            log_dict[key] = val  # already namespaced per adapter, e.g. "{job}/train/loss"
+
+    if args.use_wandb:
+        import wandb
+
+        for job_id in plan.selected_jobs:
+            if job_id not in defined_jobs:
+                wandb.define_metric(f"{job_id}/*", step_metric="engine/step")
+                defined_jobs.add(job_id)
+
+    log_dict["train/num_jobs"] = len(plan.selected_jobs)
+    log_dict["train/num_runnable_jobs"] = plan.num_runnable_jobs
+    log_dict["engine/step"] = plan.engine_step
+    tracking_utils.log(args, log_dict, step_key="engine/step")
+
+    if samples and args.use_wandb:
+        import wandb
+
+        sample_rows.extend(samples)
+        del sample_rows[:-_MAX_SAMPLE_ROWS]  # keep only the most recent rows
+        table = wandb.Table(columns=_SAMPLE_COLUMNS)
+        for row in sample_rows:
+            table.add_data(*(row.get(col) for col in _SAMPLE_COLUMNS))
+        wandb.log({"rollouts/samples": table})
+
+
 def _run_training_loop(
-    actor_model, coordinator, stop: threading.Event, *, sync_weights: bool, loaded_adapters: set
+    actor_model, coordinator, stop: threading.Event, *, args, sync_weights: bool, loaded_adapters: set
 ) -> None:
     """Continuously drain the coordinator: build plan -> execute -> commit.
 
@@ -210,6 +311,8 @@ def _run_training_loop(
     into sglang after committed steps so /sample uses the current policy.
     """
     steps_since_sync = 0
+    defined_jobs: set = set()
+    sample_rows: list = []
     while not stop.is_set():
         plan = ray.get(coordinator.build_next_plan.remote())
         if plan is None:
@@ -230,6 +333,8 @@ def _run_training_loop(
             print(f"[engine] step aborted: {first_line}", flush=True)
             continue
 
+        _log_step_metrics(args, plan, results, defined_jobs, sample_rows)
+
         if sync_weights:
             steps_since_sync += 1
             if steps_since_sync >= SYNC_EVERY:
@@ -241,6 +346,9 @@ def main() -> None:
     args = parse_args()
     actor_model, coordinator, generator, rollout_manager, controller = asyncio.run(_setup(args))
 
+    # Per-adapter + aggregate training metrics land in W&B from this driver loop.
+    _init_engine_wandb(args)
+
     # Adapter names currently loaded in sglang; shared between the train loop
     # (writer) and the /sample handler (reader) so sampling routes to an adapter
     # only once it's actually loaded.
@@ -250,7 +358,7 @@ def main() -> None:
     loop_thread = threading.Thread(
         target=_run_training_loop,
         args=(actor_model, coordinator, stop),
-        kwargs={"sync_weights": generator is not None, "loaded_adapters": loaded_adapters},
+        kwargs={"args": args, "sync_weights": generator is not None, "loaded_adapters": loaded_adapters},
         daemon=True,
     )
     loop_thread.start()

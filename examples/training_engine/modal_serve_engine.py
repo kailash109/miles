@@ -19,15 +19,17 @@ Serve + run the demo clients (single H200, detached)::
     modal run -d examples/training_engine/modal_serve_engine.py::demo \
         --wait-seconds 300 --num-clients 3 --n-adapters 16
 
-Real-math multi-job RL demo (3 GRPO jobs on gsm8k / dapo-math / deepscaler).
-Provision the datasets once, then run for ~50 steps per job (2x H200, detached)::
+Real-math multi-job RL demo (GRPO jobs on dapo-math / deepscaler / openthoughts-math).
+Provision the datasets once, then run for ~50 steps per job (8x H200 = 4 data-parallel
+trainers + 4 sglang rollout engines, detached)::
 
     modal run examples/training_engine/modal_serve_engine.py::provision_math
     modal run -d examples/training_engine/modal_serve_engine.py::demo_math_rl
 
-    # Tune it:
+    # Tune it (incl. the train/inference GPU split):
     modal run -d examples/training_engine/modal_serve_engine.py::demo_math_rl \
-        --target-steps 50 --n-samples 8 --prompts-per-iter 8 --max-new-tokens 512
+        --target-steps 50 --n-samples 8 --prompts-per-iter 8 --max-new-tokens 512 \
+        --train-gpus 4 --infer-gpus 4
 """
 
 import os
@@ -145,13 +147,14 @@ def provision():
     print("Provisioned Qwen3-4B + gsm8k into the assets volume.")
 
 
-# Real math datasets for the multi-job RL demo (one per client). gsm8k is read
-# locally by the engine server (--prompt-data); all three are loaded by the
-# client via the HF datasets cache (the huggingface-cache volume).
+# Real math datasets the clients train on (loaded via the HF datasets cache /
+# huggingface-cache volume). gsm8k is intentionally NOT here -- it's too easy
+# (reward ~1 from the start, no RL signal). gsm8k is still downloaded separately
+# below purely as the engine server's dummy --prompt-data.
 MATH_RL_DATASETS = [
-    "zhuzilin/gsm8k",
     "zhuzilin/dapo-math-17k",
     "agentica-org/DeepScaleR-Preview-Dataset",
+    "open-r1/OpenThoughts-114k-math",
 ]
 
 
@@ -162,8 +165,9 @@ MATH_RL_DATASETS = [
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
 def provision_math():
-    """Provision Qwen3-4B + gsm8k (engine) and warm the HF cache for the three
-    math RL datasets (gsm8k, dapo-math-17k, DeepScaleR) used by demo_math_rl."""
+    """Provision Qwen3-4B + gsm8k (engine --prompt-data) and warm the HF cache for
+    the math RL datasets (dapo-math-17k, DeepScaleR, OpenThoughts-114k-math) the
+    clients train on in demo_math_rl."""
     from datasets import load_dataset
     from huggingface_hub import snapshot_download
 
@@ -191,8 +195,17 @@ def _run_demo(
     api_port: int,
     client_script_name: str = "engine_client_demo.py",
     extra_client_env = None,
+    train_gpus: int = 1,
+    infer_gpus: int = 1,
+    rollout_gpus_per_engine: int = 1,
+    max_train_tokens_per_step=None,
 ):
-    """Serve the engine and run a few demo clients against it."""
+    """Serve the engine and run a few demo clients against it.
+
+    ``train_gpus`` data-parallel Megatron trainers + (RL only) ``infer_gpus``
+    sglang rollout GPUs (``rollout_gpus_per_engine`` GPUs per engine). The Modal
+    function's ``gpu=`` request must be >= train_gpus + infer_gpus.
+    """
     assets_volume.reload()
     hf_cache_volume.reload()
     _link_assets_into_root()
@@ -211,10 +224,21 @@ def _run_demo(
         "ENGINE_API_PORT": str(api_port),
         "ENGINE_N_ADAPTERS": str(n_adapters),
         "ENGINE_ENABLE_GENERATION": enable_generation,
+        "ENGINE_TRAIN_GPUS": str(train_gpus),
+        "ENGINE_INFER_GPUS": str(infer_gpus),
+        "ENGINE_ROLLOUT_GPUS_PER_ENGINE": str(rollout_gpus_per_engine),
     }
+    # Explicit per-step token budget overrides the DP-scaled default in serve_engine.
+    if max_train_tokens_per_step is not None:
+        server_env["ENGINE_MAX_TRAIN_TOKENS_PER_STEP"] = str(max_train_tokens_per_step)
     if mode == "rl":
         server_env["ENGINE_ADAPTER_STORE"] = ADAPTER_STORE_PATH
-    print(f"Starting engine server (mode={mode}, port={api_port}, slots={n_adapters}) ...", flush=True)
+    print(
+        f"Starting engine server (mode={mode}, port={api_port}, slots={n_adapters}, "
+        f"train_gpus={train_gpus}, infer_gpus={infer_gpus}, "
+        f"rollout_gpus_per_engine={rollout_gpus_per_engine}) ...",
+        flush=True,
+    )
     server = subprocess.Popen(["bash", str(serve_script)], cwd=MILES_ROOT, env=server_env)
 
     # 2) Client runner: waits for warm-up, then opens a few clients that submit jobs.
@@ -244,7 +268,10 @@ def _run_demo(
     gpu="H200:1",
     volumes=volumes,
     timeout=6 * 60 * 60,
-    secrets=[modal.Secret.from_name("huggingface-secret")],
+    secrets=[
+        modal.Secret.from_name("huggingface-secret"),
+        modal.Secret.from_name("wandb-secret"),
+    ],
 )
 def demo(max_wait: int = 1800, num_clients: int = 3, n_adapters: int = 16, api_port: int = 8000):
     """SFT demo on a single H200 (train-only, no sglang)."""
@@ -256,7 +283,10 @@ def demo(max_wait: int = 1800, num_clients: int = 3, n_adapters: int = 16, api_p
     gpu="H200:2",
     volumes=volumes,
     timeout=6 * 60 * 60,
-    secrets=[modal.Secret.from_name("huggingface-secret")],
+    secrets=[
+        modal.Secret.from_name("huggingface-secret"),
+        modal.Secret.from_name("wandb-secret"),
+    ],
 )
 def demo_rl(max_wait: int = 1800, num_clients: int = 3, n_adapters: int = 16, api_port: int = 8000):
     """Online-RL demo on 2x H200 (disaggregated: 1 trainer GPU + 1 sglang GPU)."""
@@ -265,22 +295,46 @@ def demo_rl(max_wait: int = 1800, num_clients: int = 3, n_adapters: int = 16, ap
 
 @app.function(
     image=image,
-    gpu="H200:2",
+    gpu="H200:8",
     volumes=volumes,
     timeout=6 * 60 * 60,
-    secrets=[modal.Secret.from_name("huggingface-secret")],
+    secrets=[
+        modal.Secret.from_name("huggingface-secret"),
+        modal.Secret.from_name("wandb-secret"),
+    ],
 )
 def demo_math_rl(
     max_wait: int = 1800,
-    n_adapters: int = 16,
+    n_adapters: int = 50,
     api_port: int = 8000,
     target_steps: int = 50,
     n_samples: int = 8,
     prompts_per_iter: int = 8,
-    max_new_tokens: int = 512,
+    max_new_tokens: int = 4096,
+    train_gpus: int = 4,
+    infer_gpus: int = 4,
+    rollout_gpus_per_engine: int = 1,
+    concurrency: int = 48,
+    max_train_tokens_per_step=None,
+    tokens_per_update: int = 8192,
 ):
-    """Online-RL on real math datasets: 3 concurrent GRPO jobs (gsm8k, dapo-math,
-    deepscaler), each trained for ``target_steps`` steps on 2x H200.
+    """Online-RL on real math datasets: many GRPO jobs round-robin across
+    dapo-math, deepscaler, and openthoughts-math, each trained for
+    ``target_steps`` steps on 8x H200 (4 data-parallel trainers + 4 sglang
+    rollout engines).
+
+    The 4 DP trainers shard each step's sequences (grads all-reduced in
+    Megatron), so you can push ~4x the tokens/step vs. the single-GPU trainer.
+    ``concurrency`` is how many jobs the client drives at once (each holds a hot
+    slot and submits data) -- it directly caps ``num_runnable_jobs``. How many of
+    those actually train per step is the step token budget divided by
+    ``tokens_per_update`` (per-job): by default the budget auto-scales with DP
+    size, but you can pin it with ``max_train_tokens_per_step`` (e.g.
+    ~concurrency * tokens_per_update to co-train them all). Keep ``concurrency``
+    <= ``n_adapters`` (hot slots) to avoid adapter paging thrash.
+
+    ``max_new_tokens`` caps rollout response length (4096 for long math traces,
+    matching the engine's --rollout-max-response-len=4096).
 
     Run ``provision_math`` once first to populate the base model + datasets.
     """
@@ -296,5 +350,11 @@ def demo_math_rl(
             "ENGINE_N_SAMPLES": str(n_samples),
             "ENGINE_PROMPTS_PER_ITER": str(prompts_per_iter),
             "ENGINE_MAX_NEW_TOKENS": str(max_new_tokens),
+            "ENGINE_CONCURRENCY": str(concurrency),
+            "ENGINE_TOKENS_PER_UPDATE": str(tokens_per_update),
         },
+        max_train_tokens_per_step=max_train_tokens_per_step,
+        train_gpus=train_gpus,
+        infer_gpus=infer_gpus,
+        rollout_gpus_per_engine=rollout_gpus_per_engine,
     )

@@ -561,6 +561,65 @@ def train_one_step(
     return {}, grad_norm
 
 
+def sync_train_step_no_data(
+    args: Namespace,
+    model: Sequence[DDP],
+    optimizer: MegatronOptimizer,
+    opt_param_scheduler: OptimizerParamScheduler,
+) -> dict:
+    """Drive one step's end-of-step DP collectives + optimizer step with NO data.
+
+    Counterpart to :func:`train_with_custom_forward_step` for a data-parallel
+    rank whose data shard is empty this step. It runs the *same* end-of-step
+    collectives the schedule would -- ``finalize_model_grads`` (the DP gradient
+    all-reduce, plus the per-token normalizer reduce) and ``optimizer.step()``
+    (the distributed-optimizer reduce-scatter/all-gather) -- so every DP rank
+    advances exactly one optimizer step in lockstep, without wasting a
+    forward/backward on dummy tokens.
+
+    Correctness: grads are zeroed, so this rank contributes nothing to the DP
+    grad sum and 0 to the per-token normalizer; the ranks that had data supply
+    the real grads/tokens. After ``finalize_model_grads`` every DP rank holds
+    the identical reduced gradient, so the optimizer step here applies the same
+    update as on the ranks that trained. Returns the same ``update_successful`` /
+    ``grad_norm`` bookkeeping as a normal step.
+
+    Note: this drives the grad/optimizer collectives only. The per-step loss
+    all-reduce (``aggregate_train_losses``) and any engine-level per-job metric
+    reduce are intra_dp_cp collectives the caller must still mirror with a
+    zero contribution so their shapes match the data ranks.
+    """
+    config = get_model_config(model[0])
+    config.grad_scale_func = optimizer.scale_loss
+    config.timers = None
+    config.finalize_model_grads_func = finalize_model_grads_with_empty_cache
+
+    for model_chunk in model:
+        model_chunk.zero_grad_buffer()
+    optimizer.zero_grad()
+
+    # Mirror the schedule's finalize call: pass the (zero) token count only under
+    # per-token loss, matching how forward_backward forwards total_num_tokens.
+    per_token_loss = bool(getattr(args, "calculate_per_token_loss", True))
+    num_tokens = (
+        torch.zeros([], dtype=torch.int, device=torch.cuda.current_device()) if per_token_loss else None
+    )
+    config.finalize_model_grads_func(model, num_tokens)
+
+    update_successful, grad_norm, _num_zeros = optimizer.step()
+    if update_successful:
+        opt_param_scheduler.step(increment=args.global_batch_size)
+
+    for model_chunk in model:
+        model_chunk.zero_grad_buffer()
+    optimizer.zero_grad()
+
+    return {
+        "update_successful": bool(update_successful),
+        "grad_norm": float(grad_norm) if grad_norm is not None else 0.0,
+    }
+
+
 def finalize_model_grads_with_empty_cache(*args, **kwargs):
     # TODO: this is an ad-hoc method and we should figure out why the oom happens in the first place.
     device = torch.cuda.current_device()

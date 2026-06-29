@@ -200,6 +200,8 @@ class TrainingCoordinator:
         if not any(leases.values()):
             return None
 
+        num_runnable_jobs = sum(1 for j in self.jobs.values() if is_runnable(j))
+
         plan = TrainStepPlan(
             plan_id=plan_id,
             engine_step=self.engine_step,
@@ -229,6 +231,7 @@ class TrainingCoordinator:
                 for j in job_to_slot
                 if self._should_publish(j)
             ),
+            num_runnable_jobs=num_runnable_jobs,
         )
         self.plan_store[plan_id] = PlanRecord(plan=plan, state="leased")
         self._mark_jobs_leased(plan)
@@ -244,9 +247,10 @@ class TrainingCoordinator:
         oldest = min((j.last_ready_at for j in runnable if j.last_ready_at is not None), default=now)
         if now - oldest >= self.batching.max_batch_wait_s:
             return True
-        # Workers are otherwise idle (one active plan max, driver only builds when
-        # none is active), so a minimum viable plan should dispatch.
-        return True
+        # Otherwise hold for the batching window (bounded by max_batch_wait_s
+        # above) so more jobs/tokens accumulate and co-pack into one step instead
+        # of dispatching a 1-job plan the instant a single job becomes runnable.
+        return False
 
     def _assign_slots(self, selected):
         preemptions: list[SlotPreemption] = []

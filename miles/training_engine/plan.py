@@ -80,3 +80,7 @@ class TrainStepPlan:
 
     publish_after_step: tuple[str, ...] = ()
     exports: tuple[ExportRequest, ...] = ()
+
+    # Diagnostic: how many jobs were runnable at build time (>= selected_jobs).
+    # Logged per step to compare scheduler supply vs. what actually batched.
+    num_runnable_jobs: int = 0
