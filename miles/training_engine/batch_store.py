@@ -39,6 +39,22 @@ class BatchRecord:
     leased_by_plan_id: str | None = None
 
 
+@dataclass(frozen=True)
+class JobQueueView:
+    """Cheap, metadata-only snapshot of a job's AVAILABLE batch queue.
+
+    Lets a scheduler reason about *leasable* tokens (records are indivisible:
+    ``lease_for_plan`` leases whole records), so it can size grants to what can
+    actually be handed out rather than to an idealized token target.
+    """
+
+    job_id: str
+    available_tokens: int
+    available_batches: int
+    first_batch_tokens: int | None
+    oldest_ready_at: float | None
+
+
 class BatchStore:
     def __init__(self, put_fn: Callable[[Any], Any] | None = None):
         # put_fn defaults to ray.put (lazy import); tests inject identity.
@@ -126,6 +142,24 @@ class BatchStore:
                 record.leased_by_plan_id = None
                 self.available_by_job[record.job_id].append(record.batch_id)
                 self.global_ready_tokens += record.token_count
+
+    def queue_view(self, job_id: str) -> JobQueueView:
+        ids = [
+            b
+            for b in self.available_by_job.get(job_id, [])
+            if self.records[b].state == BatchState.AVAILABLE
+        ]
+        if not ids:
+            return JobQueueView(job_id, 0, 0, None, None)
+        return JobQueueView(
+            job_id=job_id,
+            available_tokens=sum(self.records[b].token_count for b in ids),
+            available_batches=len(ids),
+            # FIFO order: available_by_job preserves insertion order and
+            # lease_for_plan consumes from the front, so ids[0] is the next record.
+            first_batch_tokens=self.records[ids[0]].token_count,
+            oldest_ready_at=min(self.records[b].created_at for b in ids),
+        )
 
     def pending_tokens(self, job_id: str) -> int:
         return sum(

@@ -97,8 +97,6 @@ unset RAY_ADDRESS
 # so instead point Ray's object store at a normal disk directory whose size
 # reports sanely. The store only holds small in-flight payload ObjectRefs here,
 # so disk-backed plasma is fine (Ray otherwise auto-falls-back to /tmp anyway).
-RAY_PLASMA_DIRECTORY="${RAY_PLASMA_DIRECTORY:-/tmp}"
-echo "[engine] using Ray plasma_directory=${RAY_PLASMA_DIRECTORY} (avoids /dev/shm 32Z overflow)" >&2
 df -h /dev/shm >&2 || true
 
 # Dump the raylet/GCS session logs so a startup failure shows its real cause
@@ -121,7 +119,6 @@ RAY_START_RETRIES="${RAY_START_RETRIES:-3}"
 for attempt in $(seq 1 "${RAY_START_RETRIES}"); do
   if ray start --head --num-gpus "$TOTAL_GPUS" \
        --dashboard-host 127.0.0.1 --dashboard-port 8265 \
-       --plasma-directory "$RAY_PLASMA_DIRECTORY" \
        --disable-usage-stats; then
     break
   fi

@@ -7,7 +7,10 @@ The coordinator owns a scheduler instance and calls ``accrue_deficits`` /
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Mapping, Protocol
+
 from .schemas import (
+    BatchingPolicy,
     Lifecycle,
     Readiness,
     Residency,
@@ -16,6 +19,38 @@ from .schemas import (
     can_preempt,
     is_runnable,
 )
+
+if TYPE_CHECKING:
+    from .batch_store import JobQueueView
+
+
+class Scheduler(Protocol):
+    """Surface the coordinator drives, satisfied by both scheduler implementations.
+
+    Selection takes a superset of arguments; a given scheduler uses what it needs
+    and ignores the rest, so either is a drop-in for the coordinator.
+    """
+
+    def accrue(self, jobs: dict[str, TrainingJobRuntime], *, round_id: int) -> None: ...
+
+    def select_training_jobs(
+        self,
+        jobs: dict[str, TrainingJobRuntime],
+        *,
+        token_budget: int,
+        max_adapters: int,
+        max_hot_slots: int | None = ...,
+        free_slots: int = ...,
+        now: float | None = ...,
+        queue_views: "Mapping[str, JobQueueView] | None" = ...,
+    ) -> list[SelectedJob]: ...
+
+    def choose_preemption_victim(
+        self,
+        hot_jobs: list[TrainingJobRuntime],
+        incoming_job: TrainingJobRuntime,
+        engine_step: int,
+    ) -> TrainingJobRuntime | None: ...
 
 
 def _accrues_credit(job: TrainingJobRuntime) -> bool:
@@ -42,6 +77,11 @@ class ContinuousTrainingScheduler:
     def accrue_deficits(self, jobs: dict[str, TrainingJobRuntime]) -> None:
         accrue_deficits(jobs, self.base_quantum_tokens)
 
+    def accrue(self, jobs: dict[str, TrainingJobRuntime], *, round_id: int | None = None) -> None:
+        # This scheduler accrues on every coordinator poll (its original behavior),
+        # so ``round_id`` is accepted only to match the shared Scheduler surface.
+        self.accrue_deficits(jobs)
+
     def _cold_load_penalty(self, job: TrainingJobRuntime) -> int:
         # Discourage loading a cold job for a tiny one-step quantum.
         return 0 if job.residency == Residency.HOT else self.base_quantum_tokens
@@ -52,7 +92,13 @@ class ContinuousTrainingScheduler:
         *,
         token_budget: int,
         max_adapters: int,
+        max_hot_slots: int | None = None,
+        free_slots: int = 0,
+        now: float | None = None,
+        queue_views: "Mapping[str, JobQueueView] | None" = None,
     ) -> list[SelectedJob]:
+        # max_hot_slots / free_slots / now / queue_views are part of the shared
+        # Scheduler surface (used by the water-fill scheduler) and ignored here.
         runnable = [j for j in jobs.values() if is_runnable(j)]
         has_credit = [
             j
@@ -123,3 +169,24 @@ class ContinuousTrainingScheduler:
             )
         )
         return candidates[0]
+
+
+def make_scheduler(batching: BatchingPolicy) -> Scheduler:
+    """Build the scheduler selected by ``batching.scheduler``.
+
+    Both implementations satisfy the ``Scheduler`` protocol, so the coordinator
+    drives whichever one this returns through the same calls.
+    """
+    if batching.scheduler == "waterfill":
+        # Imported lazily so the default path doesn't depend on the alternate impl.
+        from .scheduler_waterfill import FairWaterfillConfig, SlotSaturatingFairScheduler
+
+        return SlotSaturatingFairScheduler(
+            FairWaterfillConfig(
+                base_quantum_tokens=batching.base_quantum_tokens,
+                min_tokens_per_job=batching.min_tokens_per_job,
+            )
+        )
+    if batching.scheduler == "deficit":
+        return ContinuousTrainingScheduler(base_quantum_tokens=batching.base_quantum_tokens)
+    raise ValueError(f"unknown scheduler {batching.scheduler!r}")

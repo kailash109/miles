@@ -22,7 +22,7 @@ from .results import (
     SubmitBatchResponse,
     WorkerStepResult,
 )
-from .scheduler import ContinuousTrainingScheduler
+from .scheduler import make_scheduler
 from .schemas import (
     BatchingPolicy,
     Execution,
@@ -68,9 +68,7 @@ class TrainingCoordinator:
         self.limits = limits or QueueLimits()
         self.batch_store = batch_store or BatchStore()
         self.artifact_store = artifact_store or ArtifactStore()
-        self.scheduler = ContinuousTrainingScheduler(
-            base_quantum_tokens=self.batching.base_quantum_tokens
-        )
+        self.scheduler = make_scheduler(self.batching)
 
         self.jobs: dict[str, TrainingJobRuntime] = {}
         self.free_slots: set[int] = set(range(max_hot_slots))
@@ -164,15 +162,25 @@ class TrainingCoordinator:
 
     def build_next_plan(self) -> TrainStepPlan | None:
         now = time.time()
-        self.scheduler.accrue_deficits(self.jobs)
+        # round_id = engine_step ties credit accrual to actual scheduling rounds
+        # (engine_step advances only on commit), so schedulers that dedupe on it
+        # don't inflate share across repeated polls within one batching window.
+        self.scheduler.accrue(self.jobs, round_id=self.engine_step)
 
         if not self._should_dispatch(now):
             return None
 
+        # Built once per dispatch (not per poll); lets the scheduler size grants to
+        # leasable (whole-record) tokens rather than an idealized target.
+        queue_views = {job_id: self.batch_store.queue_view(job_id) for job_id in self.jobs}
         selected = self.scheduler.select_training_jobs(
             self.jobs,
             token_budget=self.batching.max_train_tokens_per_step,
             max_adapters=self.batching.max_adapters_per_step,
+            max_hot_slots=self.max_hot_slots,
+            free_slots=len(self.free_slots),
+            now=now,
+            queue_views=queue_views,
         )
         if selected:
             print(f"[coordinator] selected jobs: {selected}", flush=True)

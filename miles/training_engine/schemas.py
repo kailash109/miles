@@ -145,6 +145,11 @@ class BatchingPolicy:
     cost_metric: Literal["loss_tokens", "sequence_tokens"] = "loss_tokens"
     idle_sleep_s: float = 0.01
     step_timeout_s: float = 1800.0
+    # Which scheduling algorithm the coordinator drives. "deficit" is the original
+    # deficit-weighted fair scheduler (few jobs, large per-job target). "waterfill"
+    # is the slot-saturating fair water-fill scheduler (many jobs, small base grant
+    # each, then fair extra tokens) -- see scheduler_waterfill.py.
+    scheduler: Literal["deficit", "waterfill"] = "deficit"
 
 
 @dataclass(frozen=True)

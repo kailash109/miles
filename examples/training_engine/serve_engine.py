@@ -42,6 +42,8 @@ SYNC_EVERY = max(1, int(os.environ.get("ENGINE_SYNC_EVERY", "1")))
 # dispatching a step, so multiple adapters co-pack into one step instead of
 # training one job at a time. Higher = wider batches, more per-step latency.
 MAX_BATCH_WAIT_S = float(os.environ.get("ENGINE_MAX_BATCH_WAIT_S", "2.0"))
+# How often the training loop logs its plan-build cadence (attempts/s).
+_SCHED_TICK_REPORT_S = float(os.environ.get("ENGINE_SCHED_TICK_REPORT_S", "2.0"))
 # Persistent HF-PEFT adapter store (disk-load into sglang for paged-out jobs).
 ADAPTER_STORE = os.environ.get("ENGINE_ADAPTER_STORE") or None
 
@@ -103,8 +105,25 @@ async def _setup(args):
         # Router binds to the node IP (matches _start_router's get_host_info()[1]),
         # not 127.0.0.1, so use the same here.
         router_ip = get_host_info()[1]
-        generator = SglangGenerator(f"http://{router_ip}:{router_port}")
-        print(f"[engine] generation enabled; router=http://{router_ip}:{router_port}", flush=True)
+        # Bound concurrent /generate requests the same way the rollout path sizes
+        # its semaphore (server concurrency across all rollout engines). Env
+        # ENGINE_GEN_CONCURRENCY overrides; falls back to the generator default.
+        gen_concurrency = None
+        _env_gen_conc = os.environ.get("ENGINE_GEN_CONCURRENCY")
+        if _env_gen_conc:
+            gen_concurrency = int(_env_gen_conc)
+        elif getattr(args, "sglang_server_concurrency", 0):
+            gen_concurrency = (
+                args.sglang_server_concurrency
+                * max(1, args.rollout_num_gpus)
+                // max(1, args.rollout_num_gpus_per_engine)
+            )
+        generator = SglangGenerator(f"http://{router_ip}:{router_port}", max_concurrency=gen_concurrency)
+        print(
+            f"[engine] generation enabled; router=http://{router_ip}:{router_port} "
+            f"gen_concurrency={generator.max_concurrency}",
+            flush=True,
+        )
 
     n_slots = args.multi_lora_n_adapters
     if ADAPTER_STORE:
@@ -122,7 +141,11 @@ async def _setup(args):
     world = max(1, int(args.actor_num_nodes) * int(args.actor_num_gpus_per_node))
     dp_size = max(1, world // (tp * pp * cp))
     _max_tokens_env = os.environ.get("ENGINE_MAX_TRAIN_TOKENS_PER_STEP", "")
-    max_train_tokens_per_step = int(_max_tokens_env) if _max_tokens_env else n_slots * 2048 * dp_size
+    max_train_tokens_per_step = int(_max_tokens_env) if _max_tokens_env else n_slots * 131072 * dp_size
+    # "deficit" (default) packs few jobs with a large per-job target; "waterfill"
+    # admits as many jobs as the budget seats with a small base grant each, then
+    # fairly water-fills the rest -- better slot saturation with many small jobs.
+    scheduler = os.environ.get("ENGINE_SCHEDULER", "deficit")
     coordinator = make_training_coordinator(
         base_model=args.hf_checkpoint,
         max_hot_slots=n_slots,
@@ -130,6 +153,7 @@ async def _setup(args):
             max_adapters_per_step=n_slots,
             max_batch_wait_s=MAX_BATCH_WAIT_S,
             max_train_tokens_per_step=max_train_tokens_per_step,
+            scheduler=scheduler,
         ),
         limits=QueueLimits(),
         adapter_store=ADAPTER_STORE,
@@ -137,7 +161,7 @@ async def _setup(args):
     print(
         f"[engine] batching: slots={n_slots} dp_size={dp_size} "
         f"max_train_tokens_per_step={max_train_tokens_per_step} "
-        f"max_batch_wait_s={MAX_BATCH_WAIT_S}",
+        f"max_batch_wait_s={MAX_BATCH_WAIT_S} scheduler={scheduler}",
         flush=True,
     )
     return actor_model, coordinator, generator, rollout_manager, _legacy_controller
@@ -249,7 +273,9 @@ _SAMPLE_COLUMNS = ["engine_step", "adapter", "reward", "response_len", "prompt",
 _MAX_SAMPLE_ROWS = int(os.environ.get("ENGINE_LOG_SAMPLES_MAX_ROWS", "200"))
 
 
-def _log_step_metrics(args, plan, results, defined_jobs: set, sample_rows: list) -> None:
+def _log_step_metrics(
+    args, plan, results, defined_jobs: set, sample_rows: list, time_between_steps: float | None = None
+) -> None:
     """Forward this step's aggregate + per-adapter metrics to W&B/tracking.
 
     Per-adapter loss/reward/tokens/response-length arrive in
@@ -257,12 +283,15 @@ def _log_step_metrics(args, plan, results, defined_jobs: set, sample_rows: list)
     last pipeline stage); the aggregate ``loss``/``grad_norm`` are remapped under
     the ``train/`` section. Decoded sample rollouts (rank 0, env-gated) ride in
     ``_rollout_samples`` and are rendered as a rolling ``rollouts/samples`` table.
+
+    ``time_between_steps`` is the wall-clock gap (s) since the previous committed
+    step on the coordinator side; ``None`` for the first step.
     """
     merged: dict = {}
     for r in results:
         if r.ok and r.metrics:
             merged.update(r.metrics)
-    if not merged:
+    if not merged and time_between_steps is None:
         return
 
     samples = merged.pop("_rollout_samples", None)
@@ -288,6 +317,8 @@ def _log_step_metrics(args, plan, results, defined_jobs: set, sample_rows: list)
 
     log_dict["train/num_jobs"] = len(plan.selected_jobs)
     log_dict["train/num_runnable_jobs"] = plan.num_runnable_jobs
+    if time_between_steps is not None:
+        log_dict["train/time_between_steps_s"] = time_between_steps
     log_dict["engine/step"] = plan.engine_step
     tracking_utils.log(args, log_dict, step_key="engine/step")
 
@@ -313,8 +344,31 @@ def _run_training_loop(
     steps_since_sync = 0
     defined_jobs: set = set()
     sample_rows: list = []
+    # Scheduler-cadence instrumentation: the loop should TRY to build a plan as
+    # fast as possible. We count attempts/dispatches and report the rate every
+    # _SCHED_TICK_REPORT_S so the per-attempt rate doesn't flood the logs (and
+    # printing itself doesn't slow the hot loop).
+    attempts = dispatched = 0
+    last_report = time.time()
+    # Wall-clock timestamp of the previous committed step, for "time between
+    # steps" (the actual coordinator-side cadence of executed training steps).
+    last_step_time: float | None = None
     while not stop.is_set():
         plan = ray.get(coordinator.build_next_plan.remote())
+        attempts += 1
+        if plan is not None:
+            dispatched += 1
+        now = time.time()
+        if now - last_report >= _SCHED_TICK_REPORT_S:
+            elapsed = now - last_report
+            print(
+                f"[engine] scheduler cadence: {attempts / elapsed:.0f} build attempts/s "
+                f"over {elapsed:.1f}s ({attempts} attempts, {dispatched} dispatched, "
+                f"{attempts - dispatched} idle)",
+                flush=True,
+            )
+            attempts = dispatched = 0
+            last_report = now
         if plan is None:
             time.sleep(0.01)
             continue
@@ -333,7 +387,11 @@ def _run_training_loop(
             print(f"[engine] step aborted: {first_line}", flush=True)
             continue
 
-        _log_step_metrics(args, plan, results, defined_jobs, sample_rows)
+        step_time = time.time()
+        time_between_steps = step_time - last_step_time if last_step_time is not None else None
+        last_step_time = step_time
+
+        _log_step_metrics(args, plan, results, defined_jobs, sample_rows, time_between_steps)
 
         if sync_weights:
             steps_since_sync += 1

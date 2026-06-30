@@ -7,7 +7,7 @@ package on a CPU-only machine is safe. The worker-side GPU modules
 imported directly from their submodules inside the training process.
 """
 
-from .batch_store import BatchStore
+from .batch_store import BatchStore, JobQueueView
 from .client import LoraTrainingClient, ServiceClient, TrainingClient, build_job_spec
 from .coordinator import TrainingCoordinator, make_training_coordinator
 from .plan import BatchLease, ExportRequest, SlotOnload, SlotPreemption, TrainStepPlan
@@ -18,7 +18,8 @@ from .results import (
     WorkerHealth,
     WorkerStepResult,
 )
-from .scheduler import ContinuousTrainingScheduler
+from .scheduler import ContinuousTrainingScheduler, Scheduler, make_scheduler
+from .scheduler_waterfill import FairWaterfillConfig, SlotSaturatingFairScheduler
 from .schemas import (
     AdapterSpec,
     BatchingPolicy,
@@ -42,6 +43,7 @@ from .schemas import (
 
 __all__ = [
     "BatchStore",
+    "JobQueueView",
     "TrainingClient",
     "ServiceClient",
     "LoraTrainingClient",
@@ -59,6 +61,10 @@ __all__ = [
     "WorkerHealth",
     "WorkerStepResult",
     "ContinuousTrainingScheduler",
+    "Scheduler",
+    "make_scheduler",
+    "FairWaterfillConfig",
+    "SlotSaturatingFairScheduler",
     "AdapterSpec",
     "BatchingPolicy",
     "BudgetSpec",
