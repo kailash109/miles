@@ -53,9 +53,41 @@ python examples/multi_lora/run_multi_tenant_example.py --base-model /root/models
 
 ## Supported inputs
 
-Training accepts text with 1-D loss inputs. 2-D soft targets, including SDFT,
+Training accepts text with 1-D loss inputs and optional 3-D `routed_experts`
+metadata for MoE routing replay (see below). 2-D soft targets, including SDFT,
 are not supported. Sampling requires a `/sampler_weights/` path returned by
 `save_weights_for_sampler()`; `/weights/` training checkpoints cannot be sampled directly.
+
+## Rollout routing replay
+
+Start an MoE gateway with `--use-rollout-routing-replay` and router fusion disabled
+(`moe_router_fusion=False`). The startup flag installs the model's replay hooks;
+each request opts in by supplying captured expert indices in
+`loss_fn_inputs["routed_experts"]`:
+
+```python
+loss_fn_inputs["routed_experts"] = tinker.types.TensorData(
+    data=expert_indices.reshape(-1).tolist(),
+    dtype="int64",
+    shape=[len(input_tokens), num_layers, moe_router_topk],
+)
+```
+
+Rows align with **model input tokens**, including the prompt, in input order.
+Layers use global model-layer order, including dense layers in hybrid models.
+The gateway appends the final target token internally; Miles pads its route row,
+so the client must not append another row. Each MoE row contains distinct expert
+IDs in `[0, num_experts)`. An all-`-1` row marks padding or a dense layer;
+partially padded rows are rejected.
+
+Supply routes for every datum in a request or none. Replay requests are batched
+separately from ordinary requests, and both `forward` and `forward_backward`
+consume the supplied indices. Backward recomputation reuses those same indices.
+Requests without routes use normal routing even when the gateway supports replay.
+
+This is a training-input extension. Obtain the captured indices from a compatible
+rollout sampler; the gateway's sampling response does not yet expose them. This
+extension does not replay top-p/top-k sampling masks or change the loss inputs.
 
 ## Failure handling
 
