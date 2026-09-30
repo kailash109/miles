@@ -9,11 +9,20 @@ import math
 import os
 import shlex
 
+from huggingface_hub import snapshot_download
 from PIL import Image
+from tests.ci.ci_register import register_cuda_ci
 from tests.e2e.lora.tinker_gateway import running_gateway
 from transformers import AutoProcessor
 
 import tinker
+
+register_cuda_ci(
+    est_time=1200,
+    suite="stage-c-4-gpu-h200",
+    labels=["multi-lora"],
+    hardware=["hopper"],
+)
 
 BASE_MODEL = "Qwen/Qwen3-VL-30B-A3B-Instruct"
 
@@ -69,7 +78,7 @@ def test_qwen3_vl_tinker_images():
         "--sglang-context-length 4096 --sglang-cuda-graph-backend-decode disabled'"
     )
     with running_gateway(serve_args=serve_args) as base_url:
-        client = tinker.ServiceClient(base_url=base_url, api_key="miles-multimodal-validation")
+        client = tinker.ServiceClient(base_url=base_url, api_key="tml-miles-multimodal-validation")
         sampler = client.create_sampling_client(base_model=BASE_MODEL)
         for color in ("red", "blue"):
             prompt = _image_prompt(processor, color)
@@ -113,3 +122,11 @@ def test_qwen3_vl_tinker_images():
         print(f"loss before={before.metrics['loss:sum']} after={after.metrics['loss:sum']}", flush=True)
         assert after.metrics["loss:sum"] < before.metrics["loss:sum"]
         assert after.loss_fn_outputs[1]["loss:sum"].data[0] < before.loss_fn_outputs[1]["loss:sum"].data[0]
+
+
+if __name__ == "__main__":
+    if "MILES_MULTIMODAL_CHECKPOINT" not in os.environ:
+        os.environ["MILES_MULTIMODAL_CHECKPOINT"] = snapshot_download(
+            BASE_MODEL, revision="9c4b90e1e4ba969fd3b5378b57d966d725f1b86c"
+        )
+    test_qwen3_vl_tinker_images()
