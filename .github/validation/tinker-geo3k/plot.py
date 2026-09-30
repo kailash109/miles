@@ -9,7 +9,11 @@ root = Path(__file__).resolve().parent
 data = json.loads((root / 'plot-data.json').read_text())
 plt.style.use('default')
 fig, axes = plt.subplots(1, 2, figsize=(10, 4))
-axes[0].plot([x['batch'] for x in data['train']], [x['reward'] for x in data['train']])
+batches = [x['batch'] for x in data['train']]
+rewards = [x['reward'] for x in data['train']]
+smoothed = [sum(rewards[max(0, i - 2):i + 1]) / len(rewards[max(0, i - 2):i + 1]) for i in range(len(rewards))]
+axes[0].plot(batches, rewards, color='C0', alpha=0.25, linewidth=1)
+axes[0].plot(batches, smoothed, color='C0', linewidth=2.5)
 axes[0].set_title('training reward')
 axes[0].set_xlabel('batch')
 axes[0].set_ylim(0, 1)
