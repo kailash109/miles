@@ -26,7 +26,7 @@ import tinker
 from miles.rollout.rm_hub.math_utils import extract_answer, grade_answer_mathd, grade_answer_sympy
 
 register_cuda_ci(
-    est_time=3600,
+    est_time=4200,
     suite="stage-c-4-gpu-h200",
     labels=["multi-lora"],
     hardware=["hopper"],
