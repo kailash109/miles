@@ -78,3 +78,17 @@ def test_paired_targets_include_packed_experts(dense, scoped, caplog):
     assert "Expanding paired gate_proj/up_proj" in caplog.text
     assert expand_packed_hf_lora_targets(targets[:1], modules) == targets[:1]
     assert expand_packed_hf_lora_targets(targets, ["model.layers.0.mlp.gate_proj"]) == targets
+
+
+@pytest.mark.parametrize("model_type", ["qwen3_vl", "qwen3_vl_moe"])
+def test_qwen3_vl_targets_select_language_layers(model_type):
+    config = {
+        "model_type": model_type,
+        "text_config": {"num_experts": 128, "num_hidden_layers": 48},
+    }
+    targets = resolve_hf_lora_targets(config, target_modules=["attn", "mlp", "unembed"])
+    assert "model.language_model.layers.*.self_attn.q_proj" in targets
+    assert "lm_head" in targets
+    assert not any("visual" in target for target in targets)
+    mlp = "mlp.experts.gate_up_proj" if model_type == "qwen3_vl_moe" else "mlp.gate_proj"
+    assert "model.language_model.layers.*." + mlp in targets
