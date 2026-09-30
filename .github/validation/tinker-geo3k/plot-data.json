@@ -1,0 +1,163 @@
+{
+  "model": "Qwen/Qwen3-VL-30B-A3B-Instruct",
+  "dataset": "hiyouga/geometry3k",
+  "dataset_revision": "fd21e533e1e50d0662a2bf7b223e60511bd5f8b7",
+  "seed": 2026,
+  "max_tokens": 1536,
+  "lora_rank": 8,
+  "train_problems": 64,
+  "validation_problems": 32,
+  "updates": 16,
+  "group_size": 4,
+  "train": [
+    {
+      "batch": 1,
+      "reward": 0.4375,
+      "samples": 16,
+      "skipped": false
+    },
+    {
+      "batch": 2,
+      "reward": 0.625,
+      "samples": 16,
+      "skipped": false
+    },
+    {
+      "batch": 3,
+      "reward": 0.3125,
+      "samples": 16,
+      "skipped": false
+    },
+    {
+      "batch": 4,
+      "reward": 0.4375,
+      "samples": 16,
+      "skipped": false
+    },
+    {
+      "batch": 5,
+      "reward": 0.8125,
+      "samples": 16,
+      "skipped": false
+    },
+    {
+      "batch": 6,
+      "reward": 0.5,
+      "samples": 16,
+      "skipped": true
+    },
+    {
+      "batch": 7,
+      "reward": 0.4375,
+      "samples": 16,
+      "skipped": false
+    },
+    {
+      "batch": 8,
+      "reward": 0.0,
+      "samples": 16,
+      "skipped": true
+    },
+    {
+      "batch": 9,
+      "reward": 0.75,
+      "samples": 16,
+      "skipped": false
+    },
+    {
+      "batch": 10,
+      "reward": 0.6875,
+      "samples": 16,
+      "skipped": false
+    },
+    {
+      "batch": 11,
+      "reward": 0.875,
+      "samples": 16,
+      "skipped": false
+    },
+    {
+      "batch": 12,
+      "reward": 0.75,
+      "samples": 16,
+      "skipped": true
+    },
+    {
+      "batch": 13,
+      "reward": 0.9375,
+      "samples": 16,
+      "skipped": false
+    },
+    {
+      "batch": 14,
+      "reward": 0.6875,
+      "samples": 16,
+      "skipped": false
+    },
+    {
+      "batch": 15,
+      "reward": 0.4375,
+      "samples": 16,
+      "skipped": false
+    },
+    {
+      "batch": 16,
+      "reward": 0.25,
+      "samples": 16,
+      "skipped": true
+    },
+    {
+      "batch": 17,
+      "reward": 0.5,
+      "samples": 16,
+      "skipped": true
+    },
+    {
+      "batch": 18,
+      "reward": 0.625,
+      "samples": 16,
+      "skipped": false
+    },
+    {
+      "batch": 19,
+      "reward": 0.4375,
+      "samples": 16,
+      "skipped": false
+    },
+    {
+      "batch": 20,
+      "reward": 0.625,
+      "samples": 16,
+      "skipped": false
+    },
+    {
+      "batch": 21,
+      "reward": 0.625,
+      "samples": 16,
+      "skipped": false
+    }
+  ],
+  "evaluations": {
+    "eval-before": {
+      "accuracy": 0.3125,
+      "samples": 32,
+      "truncated": 17
+    },
+    "blank-before": {
+      "accuracy": 0.0625,
+      "samples": 32,
+      "truncated": 7
+    },
+    "eval-after": {
+      "accuracy": 0.375,
+      "samples": 32,
+      "truncated": 14
+    },
+    "blank-after": {
+      "accuracy": 0.0625,
+      "samples": 32,
+      "truncated": 8
+    }
+  },
+  "run_url": "https://modal.com/apps/modal-labs/kailash-dev/ap-evL8CrIZ2utEKgfS0aCKKh"
+}
