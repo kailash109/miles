@@ -61,11 +61,11 @@ def test_qwen3_vl_tinker_images():
     processor = AutoProcessor.from_pretrained(checkpoint)
     megatron_path = os.environ.get("MILES_MEGATRON_PATH", "/root/Megatron-LM")
     serve_args = (
-        f"--hf-checkpoint {shlex.quote(checkpoint)} --model-type qwen3-30B-A3B "
+        f"--hf-checkpoint {shlex.quote(checkpoint)} --model-type qwen3-vl-30B-A3B "
         f"--megatron-path {shlex.quote(megatron_path)} "
         "--num-gpus-per-node 4 --actor-num-gpus 2 --rollout-num-gpus 2 "
         "--tp 2 --ep 2 --n-adapters 1 --target-modules attn "
-        f"--extra-args '--tinker-base-model {BASE_MODEL} --rotary-base 5000000 "
+        f"--extra-args '--tinker-base-model {BASE_MODEL} "
         "--sglang-context-length 4096 --sglang-cuda-graph-backend-decode disabled'"
     )
     with running_gateway(serve_args=serve_args) as base_url:

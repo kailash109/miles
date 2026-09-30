@@ -23,12 +23,21 @@ image = (
         " && pip install --no-deps --no-build-isolation -e /opt/miles-megatron",
         "pip install --no-deps --no-build-isolation git+https://github.com/radixark/Megatron-Bridge.git@8cd3466d14d2337c8492827b3712482c2b3e4866",
     )
-    .pip_install("tinker==0.26.2", "fastapi", "uvicorn", "transformers==5.12.1")
+    .pip_install(
+        "tinker==0.26.2",
+        "fastapi",
+        "uvicorn",
+        "transformers==5.12.1",
+        "opentelemetry-api==1.44.0",
+        "opentelemetry-sdk==1.44.0",
+        "opentelemetry-exporter-otlp==1.44.0",
+    )
     .env({"PYTHONPATH": "/workspace/miles:/opt/miles-megatron", "CUDA_DEVICE_MAX_CONNECTIONS": "1"})
-    .add_local_dir(
+)
+if modal.is_local():
+    image = image.add_local_dir(
         Path(__file__).resolve().parents[3], "/workspace/miles", ignore=[".git", "__pycache__", ".pytest_cache"]
     )
-)
 
 
 @app.function(image=image, volumes={"/models": model_cache}, timeout=3600, gpu="H100:4", cpu=32, memory=196608)
@@ -37,7 +46,9 @@ def validate():
 
     os.chdir("/workspace/miles")
     model_path = "/models/Qwen3-VL-30B-A3B-Instruct"
-    snapshot_download("Qwen/Qwen3-VL-30B-A3B-Instruct", local_dir=model_path)
+    snapshot_download(
+        "Qwen/Qwen3-VL-30B-A3B-Instruct", revision="9c4b90e1e4ba969fd3b5378b57d966d725f1b86c", local_dir=model_path
+    )
     model_cache.commit()
     env = dict(os.environ, MILES_MULTIMODAL_CHECKPOINT=model_path, MILES_MEGATRON_PATH="/opt/miles-megatron")
     subprocess.run(
