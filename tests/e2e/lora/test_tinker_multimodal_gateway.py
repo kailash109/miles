@@ -4,15 +4,14 @@ Requires four GPUs and MILES_MULTIMODAL_CHECKPOINT pointing to the downloaded
 Qwen/Qwen3-VL-30B-A3B-Instruct checkpoint.
 """
 
-import io
 import math
 import os
-import shlex
 
 from huggingface_hub import snapshot_download
 from PIL import Image
 from tests.ci.ci_register import register_cuda_ci
 from tests.e2e.lora.tinker_gateway import running_gateway
+from tests.e2e.lora.tinker_multimodal_gateway import BASE_MODEL, MODEL_REVISION, image_prompt, qwen3_vl_serve_args
 from transformers import AutoProcessor
 
 import tinker
@@ -24,34 +23,12 @@ register_cuda_ci(
     hardware=["hopper"],
 )
 
-BASE_MODEL = "Qwen/Qwen3-VL-30B-A3B-Instruct"
-
 
 def _image_prompt(processor, color):
-    image = Image.new("RGB", (128, 128), color=color)
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
-    text = processor.apply_chat_template(
-        [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": image},
-                    {"type": "text", "text": "Name the solid color in this image. Answer with one word."},
-                ],
-            }
-        ],
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    before, after = text.split(processor.image_token)
-    image_tokens = processor(text=processor.image_token, images=[image], add_special_tokens=False)["input_ids"][0]
-    return tinker.ModelInput(
-        chunks=[
-            tinker.types.EncodedTextChunk(tokens=processor.tokenizer.encode(before, add_special_tokens=False)),
-            tinker.types.ImageChunk(data=buffer.getvalue(), format="png", expected_tokens=len(image_tokens)),
-            tinker.types.EncodedTextChunk(tokens=processor.tokenizer.encode(after, add_special_tokens=False)),
-        ]
+    return image_prompt(
+        processor,
+        [Image.new("RGB", (128, 128), color=color)],
+        "Name the solid color in this image. Answer with one word.",
     )
 
 
@@ -68,16 +45,7 @@ def _datum(prompt, completion):
 def test_qwen3_vl_tinker_images():
     checkpoint = os.environ["MILES_MULTIMODAL_CHECKPOINT"]
     processor = AutoProcessor.from_pretrained(checkpoint)
-    megatron_path = os.environ.get("MILES_MEGATRON_PATH", "/root/Megatron-LM")
-    serve_args = (
-        f"--hf-checkpoint {shlex.quote(checkpoint)} --model-type qwen3-vl-30B-A3B "
-        f"--megatron-path {shlex.quote(megatron_path)} "
-        "--num-gpus-per-node 4 --actor-num-gpus 2 --rollout-num-gpus 2 "
-        "--tp 2 --ep 2 --n-adapters 1 --target-modules attn "
-        f"--extra-args '--tinker-base-model {BASE_MODEL} "
-        "--sglang-context-length 4096 --sglang-cuda-graph-backend-decode disabled'"
-    )
-    with running_gateway(serve_args=serve_args) as base_url:
+    with running_gateway(serve_args=qwen3_vl_serve_args(checkpoint)) as base_url:
         client = tinker.ServiceClient(base_url=base_url, api_key="tml-miles-multimodal-validation")
         sampler = client.create_sampling_client(base_model=BASE_MODEL)
         for color in ("red", "blue"):
@@ -126,7 +94,5 @@ def test_qwen3_vl_tinker_images():
 
 if __name__ == "__main__":
     if "MILES_MULTIMODAL_CHECKPOINT" not in os.environ:
-        os.environ["MILES_MULTIMODAL_CHECKPOINT"] = snapshot_download(
-            BASE_MODEL, revision="9c4b90e1e4ba969fd3b5378b57d966d725f1b86c"
-        )
+        os.environ["MILES_MULTIMODAL_CHECKPOINT"] = snapshot_download(BASE_MODEL, revision=MODEL_REVISION)
     test_qwen3_vl_tinker_images()

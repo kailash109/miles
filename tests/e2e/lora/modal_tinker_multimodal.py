@@ -2,12 +2,15 @@
 
 From the miles checkout, with Modal credentials configured:
     modal run tests/e2e/lora/modal_tinker_multimodal.py
+    modal run tests/e2e/lora/modal_tinker_multimodal.py --suite geo3k
 
 The checkpoint is cached in a Modal Volume. GPUs stop when the test finishes.
 """
 
 import os
 import subprocess
+import tempfile
+import uuid
 from pathlib import Path
 
 import modal
@@ -32,6 +35,7 @@ image = (
         "opentelemetry-sdk==1.44.0",
         "opentelemetry-exporter-otlp==1.44.0",
     )
+    .pip_install("datasets==5.0.1", "pylatexenc==2.11")
     .env({"PYTHONPATH": "/workspace/miles:/opt/miles-megatron", "CUDA_DEVICE_MAX_CONNECTIONS": "1"})
 )
 if modal.is_local():
@@ -41,7 +45,9 @@ if modal.is_local():
 
 
 @app.function(image=image, volumes={"/models": model_cache}, timeout=3600, gpu="H100:4", cpu=32, memory=196608)
-def validate():
+def validate(suite: str = "images"):
+    if suite not in ("images", "geo3k"):
+        raise ValueError(f"unknown validation suite: {suite}")
     from huggingface_hub import snapshot_download
 
     os.chdir("/workspace/miles")
@@ -50,24 +56,44 @@ def validate():
         "Qwen/Qwen3-VL-30B-A3B-Instruct", revision="9c4b90e1e4ba969fd3b5378b57d966d725f1b86c", local_dir=model_path
     )
     model_cache.commit()
-    env = dict(os.environ, MILES_MULTIMODAL_CHECKPOINT=model_path, MILES_MEGATRON_PATH="/opt/miles-megatron")
-    subprocess.run(
-        [
-            "python",
-            "-m",
-            "pytest",
-            "tests/e2e/lora/test_tinker_multimodal_gateway.py",
-            "-s",
-            "-x",
-            "--confcutdir=tests/e2e/lora",
-            "-o",
-            "addopts=",
-        ],
-        env=env,
-        check=True,
+    output_dir = Path(f"/models/validation/{suite}-{uuid.uuid4().hex[:8]}")
+    output_dir.mkdir(parents=True)
+    print(f"Validation artifacts: {output_dir}", flush=True)
+    env = dict(
+        os.environ,
+        MILES_MULTIMODAL_CHECKPOINT=model_path,
+        MILES_MEGATRON_PATH="/opt/miles-megatron",
+        MILES_GEO3K_OUTPUT_DIR=str(output_dir),
+        HF_DATASETS_CACHE="/models/datasets",
     )
+    test_file = "test_tinker_geo3k_gateway.py" if suite == "geo3k" else "test_tinker_multimodal_gateway.py"
+    try:
+        subprocess.run(
+            [
+                "python",
+                "-m",
+                "pytest",
+                f"tests/e2e/lora/{test_file}",
+                "-s",
+                "-x",
+                "--confcutdir=tests/e2e/lora",
+                "-o",
+                "addopts=",
+            ],
+            env=env,
+            check=True,
+        )
+    finally:
+        model_cache.commit()
+    return {path.name: path.read_text() for path in output_dir.iterdir()}
 
 
 @app.local_entrypoint()
-def main():
-    validate.remote()
+def main(suite: str = "images", output_dir: str = ""):
+    artifacts = validate.remote(suite)
+    if artifacts:
+        destination = Path(output_dir or tempfile.mkdtemp(prefix="miles-multimodal-results-"))
+        destination.mkdir(parents=True, exist_ok=True)
+        for name, content in artifacts.items():
+            (destination / name).write_text(content)
+        print(f"Saved validation results to {destination}")
