@@ -1,4 +1,9 @@
-"""Real GEO3K GRPO through the Tinker SDK, including published adapter rollouts.
+"""Manual GEO3K RL validation through the Tinker SDK and miles gateway.
+
+From the repository root, with four GPUs and the runtime dependencies installed:
+    python -m examples.multi_lora.validate_geo3k
+Or use the pinned Modal environment:
+    modal run examples/multi_lora/modal_geo3k.py --output-dir ./geo3k-results
 
 Uses 64 fixed training problems, 32 held-out validation problems, groups of four,
 and up to 48 batches to obtain 16 updates with nonconstant rewards. Metrics and
@@ -6,32 +11,29 @@ rollouts are saved to MILES_GEO3K_OUTPUT_DIR. Accuracy improvement is measured,
 not asserted: this small run validates the RL path, not statistical convergence.
 """
 
+import io
 import json
 import math
 import os
 import random
+import shlex
+import signal
+import subprocess
 import tempfile
+import time
+import urllib.request
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 import numpy as np
 from datasets import load_dataset
 from huggingface_hub import snapshot_download
 from PIL import Image
-from tests.ci.ci_register import register_cuda_ci
-from tests.e2e.lora.tinker_gateway import running_gateway
-from tests.e2e.lora.tinker_multimodal_gateway import BASE_MODEL, MODEL_REVISION, image_prompt, qwen3_vl_serve_args
 from transformers import AutoProcessor
 
 import tinker
 from miles.rollout.rm_hub.math_utils import extract_answer, grade_answer_mathd, grade_answer_sympy
-
-register_cuda_ci(
-    est_time=4200,
-    suite="stage-c-4-gpu-h200",
-    labels=["multi-lora"],
-    hardware=["hopper"],
-    nightly=True,
-)
+from miles.utils.http_utils import is_port_available
 
 DATASET = "hiyouga/geometry3k"
 DATASET_REVISION = "fd21e533e1e50d0662a2bf7b223e60511bd5f8b7"
@@ -40,6 +42,98 @@ GROUP_SIZE = 4
 BATCH_SIZE = 4
 UPDATES = 16
 MAX_TOKENS = 1536
+
+
+BASE_MODEL = "Qwen/Qwen3-VL-30B-A3B-Instruct"
+MODEL_REVISION = "9c4b90e1e4ba969fd3b5378b57d966d725f1b86c"
+
+
+def _image_prompt(processor, images, text):
+    rendered = processor.apply_chat_template(
+        [
+            {
+                "role": "user",
+                "content": [*({"type": "image", "image": image} for image in images), {"type": "text", "text": text}],
+            }
+        ],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    parts = rendered.split(processor.image_token)
+    assert len(parts) == len(images) + 1
+    chunks = []
+    for prefix, image in zip(parts[:-1], images, strict=True):
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        image_ids = processor(text=processor.image_token, images=[image], add_special_tokens=False)["input_ids"][0]
+        chunks.extend(
+            [
+                tinker.types.EncodedTextChunk(tokens=processor.tokenizer.encode(prefix, add_special_tokens=False)),
+                tinker.types.ImageChunk(data=buffer.getvalue(), format="png", expected_tokens=len(image_ids)),
+            ]
+        )
+    chunks.append(
+        tinker.types.EncodedTextChunk(tokens=processor.tokenizer.encode(parts[-1], add_special_tokens=False))
+    )
+    return tinker.ModelInput(chunks=chunks)
+
+
+def _qwen3_vl_serve_args(checkpoint):
+    megatron_path = os.environ.get("MILES_MEGATRON_PATH", "/root/Megatron-LM")
+    return (
+        f"--hf-checkpoint {shlex.quote(checkpoint)} --model-type qwen3-vl-30B-A3B "
+        f"--megatron-path {shlex.quote(megatron_path)} "
+        "--num-gpus-per-node 4 --actor-num-gpus 2 --rollout-num-gpus 2 "
+        "--tp 2 --ep 2 --n-adapters 1 --target-modules attn "
+        f"--extra-args '--tinker-base-model {BASE_MODEL} "
+        "--sglang-context-length 4096 --sglang-cuda-graph-backend-decode disabled'"
+    )
+
+
+GATEWAY_PORT = 10613
+SERVE_TIMEOUT_S = 1200
+
+
+def _wait_for_gateway(server: subprocess.Popen) -> None:
+    deadline = time.time() + SERVE_TIMEOUT_S
+    url = f"http://127.0.0.1:{GATEWAY_PORT}/api/v1/healthz"
+    while time.time() < deadline:
+        if server.poll() is not None:
+            raise RuntimeError(f"gateway exited during startup with code {server.returncode}")
+        try:
+            with urllib.request.urlopen(url, timeout=2):
+                return
+        except OSError:
+            time.sleep(5)
+    raise TimeoutError(f"gateway not serving after {SERVE_TIMEOUT_S}s")
+
+
+@contextmanager
+def _running_gateway(checkpoint):
+    if not is_port_available(GATEWAY_PORT):
+        raise RuntimeError(f"port {GATEWAY_PORT} already has a listener; refusing to reuse a gateway not started here")
+    serve_cmd = (
+        "python examples/multi_lora/serve_qwen3_30b_a3b_tinker.py serve "
+        f"--lora-rank 8 --lora-alpha 16 {_qwen3_vl_serve_args(checkpoint)}"
+    )
+    server = subprocess.Popen(["bash", "-c", f"exec {serve_cmd}"], start_new_session=True)
+    try:
+        _wait_for_gateway(server)
+        yield f"http://127.0.0.1:{GATEWAY_PORT}"
+    finally:
+        try:
+            with suppress(ProcessLookupError):
+                server.terminate()
+            returncode = server.wait(timeout=180)
+            if returncode not in (0, 128 + signal.SIGTERM):
+                raise RuntimeError(f"gateway launcher failed during shutdown with code {returncode}")
+        except BaseException:
+            # A stuck launcher cannot finish its own Ray cleanup.
+            with suppress(ProcessLookupError):
+                os.killpg(server.pid, signal.SIGKILL)
+            server.wait(timeout=30)
+            subprocess.run(["ray", "stop", "--force"], check=True, timeout=120)
+            raise
 
 
 def _record(output_dir, event):
@@ -60,7 +154,7 @@ def _prompt(processor, example, *, blank=False):
     if blank:
         images = [Image.new("RGB", image.size, "white") for image in images]
     question = example["problem"].replace("<image>", "").strip()
-    return image_prompt(processor, images, question + "\nReason briefly and put your final answer in \\boxed{}.")
+    return _image_prompt(processor, images, question + "\nReason briefly and put your final answer in \\boxed{}.")
 
 
 def _reward(answer, target):
@@ -240,7 +334,7 @@ def _train(service, trainer, sampler, processor, examples, prompts, output_dir):
     return sampler, history
 
 
-def test_qwen3_vl_tinker_geo3k():
+def main():
     output_dir = Path(os.environ.get("MILES_GEO3K_OUTPUT_DIR") or tempfile.mkdtemp(prefix="miles-geo3k-"))
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = os.environ["MILES_MULTIMODAL_CHECKPOINT"]
@@ -263,7 +357,7 @@ def test_qwen3_vl_tinker_geo3k():
         "learning_rate": 1e-4,
     }
     _record(output_dir, {"kind": "config", **metadata})
-    with running_gateway(serve_args=qwen3_vl_serve_args(checkpoint)) as base_url:
+    with _running_gateway(checkpoint) as base_url:
         service = tinker.ServiceClient(base_url=base_url, api_key="tml-geo3k-validation")
         trainer = service.create_lora_training_client(
             base_model=BASE_MODEL, rank=8, train_mlp=False, train_unembed=False
@@ -299,4 +393,4 @@ def test_qwen3_vl_tinker_geo3k():
 if __name__ == "__main__":
     if "MILES_MULTIMODAL_CHECKPOINT" not in os.environ:
         os.environ["MILES_MULTIMODAL_CHECKPOINT"] = snapshot_download(BASE_MODEL, revision=MODEL_REVISION)
-    test_qwen3_vl_tinker_geo3k()
+    main()

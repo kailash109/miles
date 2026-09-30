@@ -1,10 +1,9 @@
-"""Run Qwen3-VL Tinker validation on four temporary Modal H100s.
+"""Run Qwen3-VL GEO3K RL validation on four temporary Modal H100s.
 
 From the miles checkout, with Modal credentials configured:
-    modal run tests/e2e/lora/modal_tinker_multimodal.py
-    modal run tests/e2e/lora/modal_tinker_multimodal.py --suite geo3k
+    modal run examples/multi_lora/modal_geo3k.py --output-dir ./geo3k-results
 
-The checkpoint is cached in a Modal Volume. GPUs stop when the test finishes.
+The checkpoint is cached in a Modal Volume. GPUs stop when validation finishes.
 """
 
 import os
@@ -40,14 +39,12 @@ image = (
 )
 if modal.is_local():
     image = image.add_local_dir(
-        Path(__file__).resolve().parents[3], "/workspace/miles", ignore=[".git", "__pycache__", ".pytest_cache"]
+        Path(__file__).resolve().parents[2], "/workspace/miles", ignore=[".git", "__pycache__", ".pytest_cache"]
     )
 
 
 @app.function(image=image, volumes={"/models": model_cache}, timeout=7200, gpu="H100:4", cpu=32, memory=196608)
-def validate(suite: str = "images"):
-    if suite not in ("images", "geo3k"):
-        raise ValueError(f"unknown validation suite: {suite}")
+def validate():
     from huggingface_hub import snapshot_download
 
     os.chdir("/workspace/miles")
@@ -56,7 +53,7 @@ def validate(suite: str = "images"):
         "Qwen/Qwen3-VL-30B-A3B-Instruct", revision="9c4b90e1e4ba969fd3b5378b57d966d725f1b86c", local_dir=model_path
     )
     model_cache.commit()
-    output_dir = Path(f"/models/validation/{suite}-{uuid.uuid4().hex[:8]}")
+    output_dir = Path(f"/models/validation/geo3k-{uuid.uuid4().hex[:8]}")
     output_dir.mkdir(parents=True)
     print(f"Validation artifacts: {output_dir}", flush=True)
     env = dict(
@@ -66,20 +63,9 @@ def validate(suite: str = "images"):
         MILES_GEO3K_OUTPUT_DIR=str(output_dir),
         HF_DATASETS_CACHE="/models/datasets",
     )
-    test_file = "test_tinker_geo3k_gateway.py" if suite == "geo3k" else "test_tinker_multimodal_gateway.py"
     try:
         subprocess.run(
-            [
-                "python",
-                "-m",
-                "pytest",
-                f"tests/e2e/lora/{test_file}",
-                "-s",
-                "-x",
-                "--confcutdir=tests/e2e/lora",
-                "-o",
-                "addopts=",
-            ],
+            ["python", "-m", "examples.multi_lora.validate_geo3k"],
             env=env,
             check=True,
         )
@@ -89,8 +75,8 @@ def validate(suite: str = "images"):
 
 
 @app.local_entrypoint()
-def main(suite: str = "images", output_dir: str = ""):
-    artifacts = validate.remote(suite)
+def main(output_dir: str = ""):
+    artifacts = validate.remote()
     if artifacts:
         destination = Path(output_dir or tempfile.mkdtemp(prefix="miles-multimodal-results-"))
         destination.mkdir(parents=True, exist_ok=True)

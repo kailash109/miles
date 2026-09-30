@@ -62,29 +62,21 @@ are not supported. Sampling requires a `/sampler_weights/` path returned by
 `save_weights_for_sampler()`; `/weights/` training checkpoints cannot be sampled directly.
 
 Qwen3-VL-30B-A3B uses `--model-type qwen3-vl-30B-A3B` and its matching HF
-checkpoint. The GPU acceptance test covers image-dependent sampling and training,
-mixed text/image batches, backward, and an Adam step:
+checkpoint. The manual GEO3K validation script exercises sampling, RL updates,
+and adapter publication through the official Tinker SDK:
 
 ```bash
 # Temporary four-GPU Modal run, with Modal installed and authenticated:
-modal run tests/e2e/lora/modal_tinker_multimodal.py
-```
-
-For real multimodal RL validation, run the GEO3K suite:
-
-```bash
-modal run tests/e2e/lora/modal_tinker_multimodal.py --suite geo3k --output-dir ./geo3k-results
+modal run examples/multi_lora/modal_geo3k.py --output-dir ./geo3k-results
 ```
 
 This uses a pinned `hiyouga/geometry3k` snapshot, 64 training problems, 32 held-out
-validation problems, four sampled answers per prompt, and 16 GRPO-style updates
-with binary answer rewards. Each update publishes an adapter for the next
-rollouts. It checks trainer/sampler logprob agreement and finite nonzero gradients,
-and records accuracy before/after training plus a blank-image control. Constant
-reward groups are skipped. The short run measures accuracy rather than requiring
-an increase. `summary.json` and `events.jsonl` contain the metrics, selected row
-IDs, and sampled answers. This longer test is registered for nightly `multi-lora`
-GPU CI; the small image acceptance test remains available for regular CI.
+validation problems, four sampled answers per prompt, and 16 group-relative RL
+updates. Settings match the recorded validation run: rank-8 attention LoRA,
+1,536 completion tokens, and learning rate 1e-4. Each update publishes an adapter
+for the next rollouts. `summary.json` and `events.jsonl` record rewards, before/after
+accuracy, a blank-image control, logprob agreement, and sampled answers.
+With a local four-GPU runtime, run `python -m examples.multi_lora.validate_geo3k`.
 
 The internal `multimodal_train_inputs` path also preserves preprocessed audio
 tensors. SDK `DmelChunk` audio decoding is not yet supported; Qwen3-VL has no
