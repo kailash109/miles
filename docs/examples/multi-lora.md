@@ -70,6 +70,22 @@ mixed text/image batches, backward, and an Adam step:
 modal run tests/e2e/lora/modal_tinker_multimodal.py
 ```
 
+For real multimodal RL validation, run the GEO3K suite:
+
+```bash
+modal run tests/e2e/lora/modal_tinker_multimodal.py --suite geo3k --output-dir ./geo3k-results
+```
+
+This uses a pinned `hiyouga/geometry3k` snapshot, 64 training problems, 32 held-out
+validation problems, four sampled answers per prompt, and 16 GRPO-style updates
+with binary answer rewards. Each update publishes an adapter for the next
+rollouts. It checks trainer/sampler logprob agreement and finite nonzero gradients,
+and records accuracy before/after training plus a blank-image control. Constant
+reward groups are skipped. The short run measures accuracy rather than requiring
+an increase. `summary.json` and `events.jsonl` contain the metrics, selected row
+IDs, and sampled answers. This longer test is registered for nightly `multi-lora`
+GPU CI; the small image acceptance test remains available for regular CI.
+
 The internal `multimodal_train_inputs` path also preserves preprocessed audio
 tensors. SDK `DmelChunk` audio decoding is not yet supported; Qwen3-VL has no
 audio encoder.

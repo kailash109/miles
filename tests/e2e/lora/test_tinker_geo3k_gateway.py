@@ -39,7 +39,7 @@ SEED = 2026
 GROUP_SIZE = 4
 BATCH_SIZE = 4
 UPDATES = 16
-MAX_TOKENS = 512
+MAX_TOKENS = 1536
 
 
 def _record(output_dir, event):
@@ -112,8 +112,17 @@ def _sample(sampler, processor, examples, prompts, *, count, temperature, seed, 
             group.append({"prompt": prompt, "sequence": sequence, "reward": reward})
         groups.append(group)
     rewards = [item["reward"] for group in groups for item in group]
+    sequences = [item["sequence"] for group in groups for item in group]
     _record(
-        output_dir, {"kind": "sampling", "phase": phase, "reward": float(np.mean(rewards)), "samples": len(rewards)}
+        output_dir,
+        {
+            "kind": "sampling",
+            "phase": phase,
+            "reward": float(np.mean(rewards)),
+            "samples": len(rewards),
+            "truncated": sum(sequence.stop_reason == "length" for sequence in sequences),
+            "mean_completion_tokens": float(np.mean([len(sequence.tokens) for sequence in sequences])),
+        },
     )
     return groups
 

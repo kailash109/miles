@@ -44,7 +44,7 @@ if modal.is_local():
     )
 
 
-@app.function(image=image, volumes={"/models": model_cache}, timeout=3600, gpu="H100:4", cpu=32, memory=196608)
+@app.function(image=image, volumes={"/models": model_cache}, timeout=7200, gpu="H100:4", cpu=32, memory=196608)
 def validate(suite: str = "images"):
     if suite not in ("images", "geo3k"):
         raise ValueError(f"unknown validation suite: {suite}")
