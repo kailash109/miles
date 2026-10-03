@@ -31,7 +31,7 @@ class FullTrainingRayActor(MegatronTrainRayActor):
         self._heartbeat.bump()
         self.accumulator.clear()
         if ckpt_path is not None:
-            checkpoint.load(self.model, self.optimizer, ckpt_path, load_optimizer=load_optimizer)
+            checkpoint.load(self.args, self.model, self.optimizer, ckpt_path, load_optimizer=load_optimizer)
         elif not self.model_is_pristine:
             _load_checkpoint_hf(self.model, self.optimizer, self.args, self.args.hf_checkpoint)
             reset_optimizer_states(self.optimizer)
@@ -85,7 +85,7 @@ class FullTrainingRayActor(MegatronTrainRayActor):
         self._heartbeat.bump()
         if self.accumulator.num_batches:
             return {"error": "save_state requires optim_step first; pending gradients are not checkpointed"}
-        checkpoint.save(self.model, self.optimizer, path, metadata=metadata)
+        checkpoint.save(self.args, self.model, self.optimizer, path, metadata=metadata)
         return None
 
     @with_logs

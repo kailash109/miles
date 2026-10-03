@@ -3,17 +3,15 @@
 from megatron.core import dist_checkpointing
 from megatron.core.optimizer.optimizer import ChainedOptimizer
 from megatron.core.utils import unwrap_model
+from megatron.training.checkpointing import _build_sharded_state_dict_metadata
 
 from miles.backends.megatron_utils.optimizer_state_reset import reset_optimizer_states
 from miles.backends.training_utils.checkpoint.io import write_checkpoint_dir
 from miles.backends.training_utils.parallel import get_parallel_state
 
 
-def _state(model, optimizer, *, is_loading: bool) -> dict:
-    metadata = {
-        "distrib_optim_sharding_type": "fully_sharded_model_space",
-        "dp_cp_group": get_parallel_state().intra_dp_cp.group,
-    }
+def _state(args, model, optimizer, *, is_loading: bool) -> dict:
+    metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=get_parallel_state().intra_dp_cp.group)
     chunks = unwrap_model(model)
     state = {
         "model" if len(chunks) == 1 else f"model{index}": chunk.sharded_state_dict(metadata=metadata)
@@ -30,13 +28,13 @@ def _state(model, optimizer, *, is_loading: bool) -> dict:
     return state
 
 
-def save(model, optimizer, path: str, metadata: dict | None = None) -> None:
-    state = _state(model, optimizer, is_loading=False)
+def save(args, model, optimizer, path: str, metadata: dict | None = None) -> None:
+    state = _state(args, model, optimizer, is_loading=False)
     write_checkpoint_dir(path, lambda directory: dist_checkpointing.save(state, str(directory)), metadata=metadata)
 
 
-def load(model, optimizer, path: str, *, load_optimizer: bool) -> None:
-    state = _state(model, optimizer if load_optimizer else None, is_loading=True)
+def load(args, model, optimizer, path: str, *, load_optimizer: bool) -> None:
+    state = _state(args, model, optimizer if load_optimizer else None, is_loading=True)
     loaded = dist_checkpointing.load(state, path)
     chunks = unwrap_model(model)
     for index, chunk in enumerate(chunks):
