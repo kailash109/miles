@@ -13,7 +13,7 @@ import tinker
 from tinker import types
 
 
-def validate(base_url: str, base_model: str) -> dict:
+def create_full_training_client(base_url: str, base_model: str) -> tinker.TrainingClient:
     service = tinker.ServiceClient(base_url=base_url, api_key="tml-full-training-validation")
     model_seq_id = service.holder.get_training_client_id()
     with httpx.Client(base_url=base_url, headers={"X-API-Key": "tml-full-training-validation"}, timeout=60) as http:
@@ -39,6 +39,11 @@ def validate(base_url: str, base_model: str) -> dict:
             assert time.monotonic() < deadline, "model creation timed out"
     client = tinker.TrainingClient(service.holder, model_seq_id=model_seq_id, model_id=created["model_id"])
     assert client.get_info().is_lora is False
+    return client
+
+
+def validate(base_url: str, base_model: str) -> dict:
+    client = create_full_training_client(base_url, base_model)
     rows = []
     for offset in (0, 100):
         tokens = list(range(200 + offset, 264 + offset))
