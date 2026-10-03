@@ -14,9 +14,9 @@ from tinker import types
 
 
 def validate(base_url: str, base_model: str) -> dict:
-    service = tinker.ServiceClient(base_url=base_url, api_key="full-training-validation")
+    service = tinker.ServiceClient(base_url=base_url, api_key="tml-full-training-validation")
     model_seq_id = service.holder.get_training_client_id()
-    with httpx.Client(base_url=base_url, headers={"X-API-Key": "full-training-validation"}, timeout=60) as http:
+    with httpx.Client(base_url=base_url, headers={"X-API-Key": "tml-full-training-validation"}, timeout=60) as http:
         response = http.post(
             "/api/v1/create_model",
             json={
@@ -26,7 +26,7 @@ def validate(base_url: str, base_model: str) -> dict:
                 "parameterization": {"type": "full"},
             },
         )
-        response.raise_for_status()
+        assert response.is_success, response.text
         created = response.json()
         deadline = time.monotonic() + 300
         while True:

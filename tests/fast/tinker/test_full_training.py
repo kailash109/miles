@@ -4,6 +4,7 @@ import asyncio
 from contextlib import suppress
 from types import SimpleNamespace
 
+import httpx
 import pytest
 import torch
 from tests.fast.tinker.harness import ADAM, await_settled, datum, make_service, model_payload
@@ -15,6 +16,7 @@ from miles.tinker.core.types import UserInputError
 from miles.tinker.core.utils import resolve_sampler_checkpoint
 from miles.tinker.full_training import FullTrainingBackend
 from miles.tinker.runtime import MilesBackend
+from miles.tinker.server.app import build_app
 
 
 @pytest.fixture
@@ -33,6 +35,30 @@ async def _create_full(service):
     request, model = service.create_model("tenant", model_payload(service, parameterization={"type": "full"}))
     assert (await await_settled(service, "tenant", request)).state == DONE
     return model
+
+
+async def test_full_creation_through_http(full_service):
+    transport = httpx.ASGITransport(app=build_app(full_service))
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://gateway", headers={"X-API-Key": "tenant"}
+    ) as http:
+        session = (await http.post("/api/v1/create_session", json={})).json()["session_id"]
+        payload = {
+            "session_id": session,
+            "model_seq_id": 0,
+            "base_model": "base",
+            "parameterization": {"type": "full"},
+        }
+        bad = await http.post("/api/v1/create_model", json=payload | {"parameterization": {"type": "lora"}})
+        assert bad.status_code == 400
+        bad = await http.post("/api/v1/create_model", json=payload | {"unexpected": True})
+        assert bad.status_code == 400
+        created = await http.post("/api/v1/create_model", json=payload)
+        assert created.status_code == 200, created.text
+        body = created.json()
+        assert (await await_settled(full_service, "tenant", body["request_id"])).state == DONE
+        info = await http.post("/api/v1/get_info", json={"model_id": body["model_id"]})
+        assert info.json()["is_lora"] is False
 
 
 async def test_full_model_capacity_and_parameterization(full_service):
