@@ -97,9 +97,7 @@ def test_a_zero_loss_mask_removes_the_datum_from_every_objective(monkeypatch, lo
     ids=["is", "ppo-default", "ppo-override", "cispo-default", "cispo-override", "dro-default", "dro-override"],
 )
 @pytest.mark.parametrize("multi_lora", [False, True], ids=["full", "lora"])
-def test_nonzero_objectives_and_gradients(
-    monkeypatch, recompute, loss_fn, config, token_losses, gradients, multi_lora
-):
+def test_nonzero_objectives_and_gradients(monkeypatch, recompute, loss_fn, config, token_losses, gradients, multi_lora):
     parallel = SimpleNamespace(cp=SimpleNamespace(size=1), intra_dp=SimpleNamespace(size=1))
     monkeypatch.setattr(loss_module, "get_parallel_state", lambda: parallel)
     monkeypatch.setattr(loss_module, "get_sum_of_sample_mean", lambda *_args, **_kwargs: None)

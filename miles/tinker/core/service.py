@@ -436,13 +436,7 @@ class TinkerService:
 
     def _new_sampling_session(self, tenant: str, session_id: str, model_path: str | None) -> str:
         if model_path is not None:
-            resolve_sampler_checkpoint(
-                self.config.checkpoint_root,
-                tenant,
-                model_path,
-                self.config.base_model,
-                is_lora=not self.config.full_training,
-            )
+            resolve_sampler_checkpoint(self.config.checkpoint_root, tenant, model_path, self.config.base_model, is_lora=not self.config.full_training)
         sampling_session_id = f"sampling-{uuid.uuid4().hex}"
         self.sampling_sessions[sampling_session_id] = SamplingSessionRecord(
             tenant=tenant, model_path=model_path, session_id=session_id
@@ -485,13 +479,7 @@ class TinkerService:
                 return request_id, sequence_ids
         validate_sample_payload(payload, self.config)
         lora_name, lora_path = (
-            resolve_sampler_checkpoint(
-                self.config.checkpoint_root,
-                tenant,
-                model_path,
-                self.config.base_model,
-                is_lora=not self.config.full_training,
-            )
+            resolve_sampler_checkpoint(self.config.checkpoint_root, tenant, model_path, self.config.base_model, is_lora=not self.config.full_training)
             if model_path
             else (None, None)
         )

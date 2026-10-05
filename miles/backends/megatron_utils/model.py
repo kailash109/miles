@@ -237,9 +237,7 @@ def setup_model_and_optimizer(
         setup_optimizer_state_streaming(args, optimizer)
 
     # Tinker clients supply Adam settings per step and have no fixed rollout count.
-    opt_param_scheduler = (
-        None if getattr(args, "tinker_full_training", False) else get_optimizer_param_scheduler(args, optimizer)
-    )
+    opt_param_scheduler = None if getattr(args, "tinker_full_training", False) else get_optimizer_param_scheduler(args, optimizer)
     return model, optimizer, opt_param_scheduler
 
 

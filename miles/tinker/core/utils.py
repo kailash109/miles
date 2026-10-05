@@ -54,9 +54,7 @@ def read_checkpoint_metadata(checkpoint_dir: str, tenant: str, shown_path: str) 
     return meta
 
 
-def resolve_sampler_checkpoint(
-    checkpoint_root: str, tenant: str, model_path: str, base_model: str, *, is_lora: bool = True
-) -> tuple[str, str]:
+def resolve_sampler_checkpoint(checkpoint_root: str, tenant: str, model_path: str, base_model: str, *, is_lora: bool = True) -> tuple[str, str]:
     """Return the adapter name and directory so engines can reload evicted snapshots."""
     model_id, kind, name = parse_tinker_path(model_path)
     if kind != "sampler_weights":

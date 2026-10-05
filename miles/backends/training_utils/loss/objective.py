@@ -1,5 +1,4 @@
 from argparse import Namespace
-
 import torch
 from torch.utils.checkpoint import checkpoint
 
