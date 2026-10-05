@@ -12,6 +12,7 @@ Each step uses different questions; its reward is a batch statistic, not a fixed
 import argparse
 import json
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -35,6 +36,8 @@ def validate(
     max_tokens: int = 1024,
     context_length: int = 4096,
     enable_thinking: bool = False,
+    checkpoint_interval: int = 0,
+    persist_progress: Callable[[], None] | None = None,
 ) -> dict:
     client = create_full_training_client(base_url, base_model)
     tokenizer = AutoTokenizer.from_pretrained(base_model)
@@ -58,6 +61,7 @@ def validate(
         max_tokens=max_tokens,
         context_length=context_length,
         enable_thinking=enable_thinking,
+        checkpoint_interval=checkpoint_interval,
         learning_rate=1e-5,
         seed=42,
     )
@@ -203,10 +207,14 @@ def validate(
             "initial_ratio_clip_fraction": float(np.mean((np.exp(diff) < 0.8) | (np.exp(diff) > 1.2))),
             "update_mean_abs_logprob_change": float(abs(shift).mean()),
         }
+        if checkpoint_interval and (step == 0 or (step + 1) % checkpoint_interval == 0) and step + 1 < steps:
+            record["checkpoint"] = client.save_state(f"rl-after-{step + 1}").result(timeout=600).path
         records.append(record)
         output_path.write_text(
             json.dumps({"model": base_model, "config": config, "steps": records, "rollouts": rollouts}, indent=2)
         )
+        if persist_progress is not None:
+            persist_progress()
         print(json.dumps(record), flush=True)
     checkpoint = client.save_state(f"rl-after-{steps}").result(timeout=600).path
     client.load_state_with_optimizer(checkpoint).result(timeout=600)
@@ -228,11 +236,14 @@ def validate(
         "config": config,
         "steps": records,
         "checkpoint_max_logprob_diff": float(abs(restored_logprobs - after_logprobs).max()),
+        "checkpoint": checkpoint,
         "final_sampler_works": True,
     }
     output_path = Path(output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps({**result, "rollouts": rollouts}, indent=2))
+    if persist_progress is not None:
+        persist_progress()
     print("RL_VALIDATION_RESULT=" + json.dumps(result), flush=True)
     return result
 
@@ -249,5 +260,8 @@ if __name__ == "__main__":
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--context-length", type=int, default=4096)
     parser.add_argument("--enable-thinking", action="store_true")
+    parser.add_argument(
+        "--checkpoint-interval", type=int, default=0, help="Save after the first update and every N updates"
+    )
     args = parser.parse_args()
     validate(**vars(args))
