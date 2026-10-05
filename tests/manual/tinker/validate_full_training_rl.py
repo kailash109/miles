@@ -37,6 +37,7 @@ def validate(
     context_length: int = 4096,
     enable_thinking: bool = False,
     checkpoint_interval: int = 0,
+    learning_rate: float = 1e-6,
     persist_progress: Callable[[], None] | None = None,
 ) -> dict:
     client = create_full_training_client(base_url, base_model)
@@ -62,11 +63,11 @@ def validate(
         context_length=context_length,
         enable_thinking=enable_thinking,
         checkpoint_interval=checkpoint_interval,
-        learning_rate=1e-5,
+        learning_rate=learning_rate,
         seed=42,
     )
     print(json.dumps({"phase": "config", "model": base_model, **config}), flush=True)
-    adam = types.AdamParams(learning_rate=1e-5, grad_clip_norm=1.0)
+    adam = types.AdamParams(learning_rate=learning_rate, grad_clip_norm=1.0)
     records, rollouts = [], []
     for step in range(steps):
         started = time.monotonic()
@@ -260,6 +261,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-tokens", type=int, default=1024)
     parser.add_argument("--context-length", type=int, default=4096)
     parser.add_argument("--enable-thinking", action="store_true")
+    parser.add_argument("--learning-rate", type=float, default=1e-6)
     parser.add_argument(
         "--checkpoint-interval", type=int, default=0, help="Save after the first update and every N updates"
     )
